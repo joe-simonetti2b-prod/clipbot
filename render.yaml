@@ -1,0 +1,42 @@
+# Render Blueprint — offre gratuite (aucune carte bancaire)
+# Render → New → Blueprint → choisir le dépôt : ce fichier est lu automatiquement,
+# et Render te demande de remplir les variables marquées « sync: false ».
+#
+# Profil « léger » : la machine gratuite est petite (≈ 0,1 CPU, 512 Mo) et sans
+# disque persistant. D'où : 1 live à la fois, sortie 720×1280, transcription
+# déléguée à Groq (gratuit), et keep-alive automatique pour ne pas s'endormir.
+services:
+  - type: web
+    name: clipbot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true            # chaque mise à jour poussée sur GitHub est déployée
+    envVars:
+      # --- à remplir à la création ---
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_PAIR_CODE
+        sync: false
+      - key: ALLOWED_CHANNELS
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      # --- réglages du profil léger ---
+      - key: MAX_CONCURRENT_STREAMS
+        value: "1"
+      - key: STREAM_FORMAT
+        value: "best[height<=720]/best"
+      - key: OUTPUT_HEIGHT
+        value: "1280"
+      - key: X264_PRESET
+        value: "ultrafast"
+      - key: WHISPER_MODEL
+        value: "tiny"            # secours local si Groq est indisponible
+      - key: WHISPER_THREADS
+        value: "1"
+      - key: LANGUAGES
+        value: "fr"
+      - key: RETENTION_DAYS
+        value: "1"

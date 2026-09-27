@@ -44,12 +44,17 @@ class TikTokError(RuntimeError):
     pass
 
 
+def _fields(names: list[str]) -> str:
+    return ",".join(names)
+
+
 class TikTokClient:
     def __init__(self, client_key: str, client_secret: str, mode: str, public_url: str,
-                 store: Store, session: aiohttp.ClientSession):
+                 store: Store, session: aiohttp.ClientSession, analytics: bool = True):
         self.key = client_key
         self.secret = client_secret
         self.mode = mode
+        self.analytics_wanted = analytics
         self.redirect_uri = f"{public_url}/tiktok/callback"
         self.store = store
         self.session = session
@@ -91,6 +96,15 @@ class TikTokClient:
         if err in ("invalid_client", "invalid_client_key", "invalid_client_secret"):
             return False, desc or err
         return None, f"{err} {desc}".strip() or str(payload)[:200]
+
+    def note_auth_error(self, err: str) -> bool:
+        """TikTok a refusé la connexion avant même l'échange du code (souvent : un scope
+        demandé n'est pas activé sur l'app dans le portail développeur). Si c'est le cas et
+        qu'on avait demandé les scopes d'analytics, on les retire et on dit de relancer."""
+        if self.analytics_wanted and any(w in err.lower() for w in ("scope", "permission")):
+            self.store.set("tiktok_analytics_denied", True)
+            return True
+        return False
 
     async def handle_callback(self, code: str, state: str) -> None:
         if not state or state != self.store.get("tiktok_oauth_state"):
@@ -187,6 +201,56 @@ class TikTokClient:
         status = await self._wait_status(publish_id)
         log.info("TikTok %s : %s (%s)", self.mode, publish_id, status)
         return publish_id
+
+    # ------------------------------------------------------------ analytics
+    async def creator_stats(self) -> dict | None:
+        """Abonnés, mentions J'aime totales, nb de vidéos (scope user.info.stats)."""
+        if not self.connected:
+            return None
+        try:
+            token = await self._access_token()
+            fields = _fields(["display_name", "follower_count", "likes_count", "video_count"])
+            async with self.session.get(
+                f"{API}/user/info/", params={"fields": fields},
+                headers={"Authorization": f"Bearer {token}"},
+            ) as r:
+                payload = await r.json(content_type=None)
+        except Exception as e:
+            log.warning("Stats TikTok indisponibles : %s", e)
+            return None
+        err = (payload.get("error") or {}).get("code")
+        if err not in (None, "ok"):
+            if err in ("scope_not_authorized", "access_token_invalid"):
+                self.store.set("tiktok_analytics_denied", True)
+                log.warning("Scope stats TikTok non autorisé -> analytics coupées (%s)", err)
+            return None
+        return (payload.get("data") or {}).get("user")
+
+    async def video_list(self, max_count: int = 20) -> list[dict]:
+        """Vidéos publiées récemment, avec leurs vues (scope video.list)."""
+        if not self.connected:
+            return []
+        try:
+            token = await self._access_token()
+            fields = _fields(["id", "create_time", "share_url", "video_description",
+                              "view_count", "like_count", "comment_count", "share_count"])
+            async with self.session.post(
+                f"{API}/video/list/", params={"fields": fields},
+                json={"max_count": max_count},
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json; charset=UTF-8"},
+            ) as r:
+                payload = await r.json(content_type=None)
+        except Exception as e:
+            log.warning("Liste des vidéos TikTok indisponible : %s", e)
+            return []
+        err = (payload.get("error") or {}).get("code")
+        if err not in (None, "ok"):
+            if err in ("scope_not_authorized", "access_token_invalid"):
+                self.store.set("tiktok_analytics_denied", True)
+                log.warning("Scope video.list TikTok non autorisé -> analytics coupées (%s)", err)
+            return []
+        return (payload.get("data") or {}).get("videos") or []
 
     async def _wait_status(self, publish_id: str, tries: int = 20) -> str:
         status = "PROCESSING_UPLOAD"

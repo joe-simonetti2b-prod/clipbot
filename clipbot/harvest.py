@@ -21,6 +21,7 @@ import re
 import time
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -31,6 +32,10 @@ from .storage import Store
 log = logging.getLogger(__name__)
 
 MAX_CLIP_S = 90
+# Défense en profondeur : même si le regex d'appel est déjà strict, on revérifie l'hôte
+# juste avant de lancer yt-dlp (aucune URL arbitraire postée dans un chat n'est téléchargée).
+ALLOWED_HOSTS = {"clips.twitch.tv", "twitch.tv", "www.twitch.tv", "m.twitch.tv",
+                 "kick.com", "www.kick.com", "m.kick.com"}
 PER_CREATOR_GAP_S = 10 * 60      # au plus un clip de viewer par créateur toutes les 10 min
 MAX_PER_HOUR = 6
 TOP_EVERY_S = 30 * 60
@@ -118,6 +123,8 @@ class ClipHarvester:
                 log.warning("Clip %s non récupéré : %s", url, e)
 
     async def _fetch(self, c: StreamCandidate, url: str, note: str, views: float) -> None:
+        if urlparse(url).hostname not in ALLOWED_HOSTS:
+            raise RuntimeError(f"hôte non autorisé : {url}")
         cid = clip_id(url)
         base = self.dir / f"clip_{re.sub(r'[^a-z0-9_-]', '', cid)[:60]}"
         proc = await asyncio.create_subprocess_exec(

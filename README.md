@@ -88,6 +88,7 @@ seul changement par cycle. La file de montage alterne entre les créateurs.
 | `/lives` | choisir à la main les lives suivis (boutons) ; `/suivre pseudo` ; `/algo` pour revenir en auto |
 | `/tag @compte` · `/outro on/off` | tag incrusté sur les vidéos · fin « S'abonner / Partager » |
 | `/relance` | renvoyer tout de suite la file vers TikTok |
+| `/whop nom taux règles…` · `/whop off nom` · `/whop` | suivre une campagne Whop : ajoute les règles à la légende et renvoie le lien de la vidéo une fois publiée |
 | `/pause` · `/resume` | couper / relancer la surveillance |
 | `/tiktok` | lien de connexion TikTok (une fois) |
 

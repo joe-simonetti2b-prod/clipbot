@@ -20,6 +20,7 @@ from aiohttp import web
 from .config import Settings
 from .discovery import parse_spec
 from .harvest import ClipHarvester
+from .analytics import TikTokAnalytics
 from .models import HypeEvent, StreamCandidate
 from .pipeline import Pipeline
 from .recorder import RawClip
@@ -64,6 +65,7 @@ class App:
             if time.time() < self.pipeline.tiktok_full_until:
                 tt += (f"\n  🟡 5 vidéos en attente dans TikTok (publie-les) · "
                        f"{self.pipeline.waiting_count()} clips en file")
+            tt += self.tt_analytics.status_line()
             yt = ("non configuré" if not self.youtube.configured else
                   "connecté" if self.youtube.connected else "à connecter → /youtube")
             return (f"{'⏸️ EN PAUSE' if self.orch.paused else '🟢 ACTIF'} · "
@@ -167,6 +169,36 @@ class App:
             return (f"Tag incrusté sur les vidéos : {cur}" if cur else
                     "Aucun tag incrusté. /tag @toncompte pour en mettre un.")
 
+        def whop_campaigns() -> dict:
+            return store.get("whop_campaigns", {})
+
+        async def whop(args):
+            camps = whop_campaigns()
+            if not args:
+                if not camps:
+                    return ("Aucune campagne Whop enregistrée.\n"
+                            "Usage : /whop <chaîne> <taux ex: 1$/1000> <règles/hashtags à ajouter>\n"
+                            "/whop off <chaîne> pour arrêter.")
+                lines = [f"  • {ch} — {c.get('rate', '?')} — {c.get('rules') or 'aucune règle ajoutée'}"
+                        for ch, c in camps.items()]
+                return "Campagnes Whop suivies :\n" + "\n".join(lines)
+            if args[0].lower() == "off" and len(args) > 1:
+                name = parse_spec(args[1])[1]
+                camps.pop(name, None)
+                store.set("whop_campaigns", camps)
+                return f"➖ Campagne Whop retirée pour {name}."
+            if len(args) < 2:
+                return "Usage : /whop <chaîne> <taux> <règles…> — ou /whop off <chaîne>"
+            name = parse_spec(args[0])[1]
+            rate = args[1]
+            rules = " ".join(args[2:])
+            camps[name] = {"rate": rate, "rules": rules}
+            store.set("whop_campaigns", camps)
+            return (f"📌 Campagne Whop enregistrée pour {name} ({rate}).\n"
+                    + (f"Règles ajoutées aux légendes de ses clips : {rules}\n" if rules else "")
+                    + "Dès qu'un clip de cette chaîne est publié, je te renvoie le lien de la "
+                    "vidéo TikTok à coller sur Whop (si les statistiques TikTok sont actives).")
+
         async def outro(args):
             if args and args[0].lower() in ("on", "off"):
                 store.set("outro", args[0].lower() == "on")
@@ -250,7 +282,8 @@ class App:
 
         tg.commands.update({"status": status, "auto": auto, "pause": pause, "resume": resume,
                             "add": add, "remove": remove, "chaines": chaines, "tiktok": tiktok, "youtube": youtube, "relance": relance,
-                            "lives": lives, "suivre": suivre, "algo": algo, "tag": tag, "outro": outro})
+                            "lives": lives, "suivre": suivre, "algo": algo, "tag": tag, "outro": outro,
+                            "whop": whop})
 
     # ------------------------------------------------------ exécution
     async def run(self) -> None:
@@ -272,7 +305,7 @@ class App:
             self.tiktok = TikTokClient(self.s.publish.tiktok_client_key,
                                        self.s.publish.tiktok_client_secret,
                                        self.s.publish.tiktok_mode, self.s.server.public_url,
-                                       self.store, session)
+                                       self.store, session, analytics=self.s.publish.tiktok_analytics)
             self.youtube = YouTubeClient(self.s.publish.youtube_client_id,
                                          self.s.publish.youtube_client_secret,
                                          self.s.publish.youtube_privacy, self.s.server.public_url,
@@ -287,6 +320,7 @@ class App:
                 top_channels=self._top_channels, enabled_top=p.top_clips)
             if p.viewer_clips:
                 self.orch.on_link = self.harvester.offer
+            self.tt_analytics = TikTokAnalytics(self.store, self.tiktok, self.tg.send)
             self._register_commands()
 
             runner = web.AppRunner(build_app(self))
@@ -303,6 +337,7 @@ class App:
                 ("keepalive", self._keepalive(session)),
                 ("backup", self.backup.run()),
                 ("harvester", self.harvester.run()),
+                ("tt_analytics", self.tt_analytics.run()),
             )]
             self._log_config()
             await self.tg.send("🟢 clipbot démarré. /status")

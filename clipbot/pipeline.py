@@ -161,7 +161,9 @@ class Pipeline:
                               keep_loaded=p.whisper_keep_loaded)
         # Mentions exigées par la campagne de ce streamer + appel à l'action global
         tags = p.channel_tags.get((clip["channel"] or "").lower(), "")
-        cta = "\n".join(x for x in (tags, p.cta_text) if x)
+        whop = self.store.get("whop_campaigns", {}).get((clip["channel"] or "").lower())
+        whop_rules = whop.get("rules") if whop else ""
+        cta = "\n".join(x for x in (tags, whop_rules, p.cta_text) if x)
         llm = LLM.from_settings(p)
         # Note + textes d'abord : un clip mal noté n'est jamais monté (gain de CPU)
         out_lang = p.target_lang or tr.language or "fr"
@@ -308,7 +310,8 @@ class Pipeline:
                     "Je garde les meilleurs clips en file et je les envoie dès qu'il y a de la place.")
             return
         if ids:
-            self.store.update_clip(cid, status="published", publish_id=json.dumps(ids), error=None)
+            self.store.update_clip(cid, status="published", publish_id=json.dumps(ids),
+                                   error=None, published_at=time.time())
             await self.tg.send(f"Clip #{cid}\n" + "\n".join(report))
             return
         # Échec partout (ex. limite de 5 brouillons TikTok atteinte) : le clip n'est pas

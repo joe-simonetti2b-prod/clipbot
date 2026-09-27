@@ -865,3 +865,98 @@ def test_render_outro_and_av_sync(tmp_path):
                          capture_output=True, text=True).stderr
     beep = float(re.search(r"silence_end: ([\d.]+)", sil).group(1))
     assert beep == pytest.approx(3.5, abs=0.1)
+
+
+# ---------------------------------------------------------------- v4 : missions & Whop
+def test_harvest_rejects_disallowed_host():
+    from clipbot.harvest import ClipHarvester
+    import tempfile
+    h = ClipHarvester.__new__(ClipHarvester)  # pas besoin d'un store réel pour ce test
+    from clipbot.models import StreamCandidate
+    c = StreamCandidate(Platform.TWITCH, "x", "1", "https://x", "", "", 1)
+    with pytest.raises(RuntimeError, match="hôte non autorisé"):
+        asyncio.run(h._fetch(c, "https://evil.com/clips.twitch.tv/x", "posté", 0))
+
+
+def test_analytics_matching_and_rewards_milestones(tmp_path):
+    from clipbot.analytics import TikTokAnalytics, REWARDS_FOLLOWERS, REWARDS_VIEWS_30D
+    store = Store(tmp_path / "db.sqlite")
+    store.set("whop_campaigns", {"nico_la": {"rate": "1$/1000", "rules": "#clip2b"}})
+    import time as _t
+    pub_at = _t.time() - 3600
+    cid = store.add_clip(platform="twitch", channel="nico_la", stream_url="https://x",
+                         status="published", caption="Il ne s'attendait pas à ça viens voir",
+                         published_at=pub_at)
+    videos = [{"id": "v1", "create_time": pub_at + 1800, "share_url": "https://tiktok.com/@x/video/v1",
+              "video_description": "Il ne s'attendait pas à ça viens voir #clip2b", "view_count": 500}]
+    notified = []
+
+    class FakeTikTok:
+        connected = True
+        analytics = True
+        async def creator_stats(self):
+            return {"follower_count": 2000, "likes_count": 10, "video_count": 3}
+        async def video_list(self, max_count=30):
+            return videos
+
+    async def notify(text):
+        notified.append(text)
+
+    a = TikTokAnalytics(store, FakeTikTok(), notify)
+    asyncio.run(a.tick())
+    row = store.clip(cid)
+    assert row["tiktok_video_id"] == "v1" and row["tiktok_views"] == 500
+    assert any("Colle ce lien sur Whop" in n for n in notified)
+    assert store.get("tiktok_views_30d")["views"] == 500
+    # sous 25 % du seuil -> pas encore de palier notifié
+    assert not any("Missions TikTok" in n or "Seuils des missions" in n for n in notified)
+
+    # Un cycle plus tard, le compte franchit 25 % du seuil -> une notification de palier
+    class BiggerTikTok(FakeTikTok):
+        async def creator_stats(self):
+            return {"follower_count": 5000, "likes_count": 10, "video_count": 3}
+        async def video_list(self, max_count=30):
+            return [{**videos[0], "view_count": 40000}]
+    a2 = TikTokAnalytics(store, BiggerTikTok(), notify)
+    asyncio.run(a2.tick())
+    assert any("Missions TikTok" in n for n in notified)
+
+
+def test_whop_command_registers_and_applies_to_caption():
+    async def scenario():
+        from clipbot.app import App
+        from clipbot.config import Settings
+        app = App(Settings())
+        app._register_commands = App._register_commands.__get__(app)
+
+        class Fake:
+            commands = {}
+            callbacks = {}
+        app.tg = Fake()
+
+        class FakeOrch:
+            watchers = {}
+            paused = False
+            class scanner:
+                resolution = None
+                @staticmethod
+                def specs(): return []
+            def rescan(self): pass
+        app.orch = FakeOrch()
+
+        class FakePipeline:
+            auto = False
+            tiktok_full_until = 0
+        app.pipeline = FakePipeline()
+
+        class FakeTT:
+            configured = False
+        app.tiktok = FakeTT()
+        app.youtube = FakeTT()
+        App._register_commands(app)
+        out = await app.tg.commands["whop"](["nico_la", "1$/1000", "#clip2b", "@nico_la"])
+        assert "nico_la" in out
+        assert app.store.get("whop_campaigns")["nico_la"]["rules"] == "#clip2b @nico_la"
+        out2 = await app.tg.commands["whop"]([])
+        assert "nico_la" in out2
+    asyncio.run(scenario())

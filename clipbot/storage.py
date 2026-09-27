@@ -48,6 +48,12 @@ class Store:
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(clips)")}
         if "peak_at" not in cols:   # moment fort (s depuis le début du clip) : flash au montage
             self.db.execute("ALTER TABLE clips ADD COLUMN peak_at REAL")
+        if "published_at" not in cols:
+            self.db.execute("ALTER TABLE clips ADD COLUMN published_at REAL")
+        if "tiktok_video_id" not in cols:  # retrouvée via l'API (analytics) une fois publiée
+            self.db.execute("ALTER TABLE clips ADD COLUMN tiktok_video_id TEXT")
+            self.db.execute("ALTER TABLE clips ADD COLUMN tiktok_url TEXT")
+            self.db.execute("ALTER TABLE clips ADD COLUMN tiktok_views INTEGER")
         # Au redémarrage, un clip resté « en cours » est remis dans la file.
         self.db.execute("UPDATE clips SET status='extracted' WHERE status='processing'")
         self.db.execute("UPDATE clips SET status='approved' WHERE status='publishing'")

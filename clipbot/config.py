@@ -146,6 +146,10 @@ class PublishConfig:
     youtube_client_secret: str = _env("YOUTUBE_CLIENT_SECRET")
     youtube_privacy: str = _env("YOUTUBE_PRIVACY", "public")
     auto_publish: bool = _env("AUTO_PUBLISH", "false", _bool)
+    # Statistiques du compte + liste des vidéos (missions TikTok, lien auto pour Whop).
+    # Si l'app ne les a pas activées dans le portail développeur, la connexion le dit et
+    # les coupe elle-même : pas besoin d'y toucher à la main dans ce cas.
+    tiktok_analytics: bool = _env("TIKTOK_ANALYTICS", "true", _bool)
 
 
 @dataclass

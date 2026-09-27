@@ -83,7 +83,15 @@ def build_app(a: "App") -> web.Application:
     async def tiktok_callback(req: web.Request):
         try:
             if "error" in req.query:
-                raise RuntimeError(req.query.get("error_description") or req.query["error"])
+                err = req.query.get("error_description") or req.query["error"]
+                if a.tiktok.note_auth_error(err):
+                    await a.tg.send(
+                        f"⚠️ Connexion TikTok échouée ({err}) — probablement les statistiques "
+                        "(user.info.stats / video.list) non activées sur l'app. J'ai coupé cette "
+                        "option automatiquement : relance /tiktok pour te connecter sans elle.")
+                    return web.Response(text=PAGE.format(title="Échec", body=html.escape(err)),
+                                        content_type="text/html", status=400)
+                raise RuntimeError(err)
             await a.tiktok.handle_callback(req.query.get("code", ""), req.query.get("state", ""))
         except Exception as e:
             log.error("Connexion TikTok échouée : %s", e)

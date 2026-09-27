@@ -123,6 +123,7 @@ class TelegramBot:
                 ("relance", "Renvoyer la file vers TikTok"),
                 ("lives", "Choisir les lives suivis"), ("algo", "Lives choisis par l'algorithme"),
                 ("tag", "Tag incrusté sur les vidéos"), ("outro", "on/off fin avec S'abonner"),
+                ("whop", "Campagnes Whop suivies"),
             ]]})
         offset = self.store.get("telegram_offset", 0)
         while True:

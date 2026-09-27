@@ -708,3 +708,23 @@ def test_frozen_capture_is_restarted_in_ytdlp_mode(tmp_path):
         return rec
     rec = asyncio.run(scenario())
     assert rec.mode == "pipe" and Frozen.spawns[0] == "direct"   # figée -> bascule yt-dlp
+
+
+def test_noisy_capture_process_does_not_block(tmp_path):
+    """Un processus qui écrit beaucoup sur sa sortie d'erreur ne doit pas se bloquer."""
+    from clipbot.config import CaptureConfig
+    from clipbot.models import StreamCandidate
+    from clipbot.recorder import StreamRecorder
+
+    async def scenario():
+        c = StreamCandidate(Platform.TWITCH, "x", "1", "https://x", "", "", 1)
+        rec = StreamRecorder(c, CaptureConfig(work_dir=tmp_path, segment_s=2))
+        # 500 Ko de messages d'erreur : bloquerait sans vidange (tampon ~64 Ko)
+        p = await asyncio.create_subprocess_exec(
+            "python3", "-c", "import sys\nfor i in range(10000): sys.stderr.write('x'*50+'\\n')",
+            stderr=asyncio.subprocess.PIPE)
+        rec._drain(p, "bruyant")
+        await asyncio.wait_for(p.wait(), 10)
+        return p.returncode, list(rec._err_tail)
+    code, tail = asyncio.run(scenario())
+    assert code == 0 and tail and tail[-1].startswith("bruyant:")

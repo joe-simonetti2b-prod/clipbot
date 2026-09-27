@@ -17,6 +17,7 @@ pic + post_roll] puis on coupe précisément.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import logging
 import os
@@ -58,6 +59,8 @@ class StreamRecorder:
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
         self._procs: list[asyncio.subprocess.Process] = []
         self.mode = "direct"
+        self._err_tail: deque[str] = deque(maxlen=6)
+        self._drains: list[asyncio.Future] = []
         self._stopping = False
         self.alive = asyncio.Event()
 
@@ -103,6 +106,7 @@ class StreamRecorder:
                 stdin=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
             )
             self._procs = [ffmpeg, ffmpeg]
+            self._drain(ffmpeg, "ffmpeg")
             return
         # Mode de secours : yt-dlp télécharge et envoie le flux à FFmpeg par un tuyau
         r_fd, w_fd = os.pipe()
@@ -119,8 +123,23 @@ class StreamRecorder:
         os.close(r_fd)
         os.close(w_fd)
         self._procs = [ytdlp, ffmpeg]
+        self._drain(ytdlp, "yt-dlp")
+        self._drain(ffmpeg, "ffmpeg")
 
     STALL_S = 40          # aucune vidéo écrite depuis 40 s = capture figée
+
+    def _drain(self, proc: asyncio.subprocess.Process, name: str) -> None:
+        """Lit en continu la sortie d'erreur d'un processus. Sans ça, dès que ~64 Ko
+        de messages s'accumulent (pubs Twitch, discontinuités), le processus se
+        bloque en écriture et la capture se fige sans planter."""
+        async def pump():
+            try:
+                while line := await proc.stderr.readline():
+                    self._err_tail.append(f"{name}: {line.decode(errors='ignore').strip()}")
+            except Exception:
+                pass
+        if proc.stderr:
+            self._drains.append(asyncio.ensure_future(pump()))
     WATCH_EVERY_S = 10.0
 
     def _last_write_age(self, started: float) -> float:
@@ -149,12 +168,12 @@ class StreamRecorder:
             self.alive.clear()
             if self._stopping:
                 break
-            err = ""
-            if src.stderr and not stalled:
-                try:
-                    err = (await asyncio.wait_for(src.stderr.read(), 5)).decode(errors="ignore").strip()[-300:]
-                except asyncio.TimeoutError:
-                    pass
+            await asyncio.sleep(0.2)
+            for d in self._drains:
+                d.cancel()
+            self._drains.clear()
+            err = " | ".join(self._err_tail)[-400:]
+            self._err_tail.clear()
             short = time.time() - started < 120
             if self.mode == "direct" and (stalled or short):
                 direct_fails += 1
@@ -164,9 +183,12 @@ class StreamRecorder:
                                 "figée" if stalled else "instable", self.c.key)
             # Une coupure après une longue capture = jeton expiré ou micro-coupure.
             failures = failures + 1 if short else 0
-            log.warning("Capture %s interrompue (%s) — tentative %d/5", self.c.key,
-                        "aucune vidéo depuis 40 s" if stalled else (err or "fin de flux"), failures)
-            await asyncio.sleep(min(5 * failures, 30))
+            reason = "aucune vidéo depuis 40 s" if stalled else "arrêt"
+            log.warning("Capture %s interrompue (%s%s) — tentative %d/5", self.c.key, reason,
+                        f" ; derniers messages : {err}" if err else "", failures)
+            pause_end = time.time() + min(5 * failures, 30)
+            while time.time() < pause_end and not self._stopping:   # pause interruptible
+                await asyncio.sleep(0.5)
         log.info("Capture %s terminée", self.c.key)
 
     async def janitor(self) -> None:

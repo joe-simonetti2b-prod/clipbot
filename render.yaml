@@ -32,6 +32,8 @@ services:
         value: "1280"
       - key: X264_PRESET
         value: "ultrafast"
+      - key: FFMPEG_THREADS
+        value: "1"               # RAM : ~170 Mo par montage au lieu de ~350 Mo
       - key: WHISPER_MODEL
         value: "tiny"            # secours local si Groq est indisponible
       - key: WHISPER_THREADS

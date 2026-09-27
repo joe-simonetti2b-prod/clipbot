@@ -416,3 +416,14 @@ def test_tiktok_credentials_check(tmp_path):
             finally:
                 tt_mod.TOKEN_URL = orig
     asyncio.run(scenario())
+
+
+def test_tiktok_login_requests_only_mode_scopes(tmp_path):
+    import urllib.parse as up
+    store = Store(tmp_path / "s.db")
+    inbox = TikTokClient("sbkey", "s", "inbox", "https://x", store, None)
+    q = up.parse_qs(up.urlparse(inbox.login_url()).query)
+    assert q["scope"] == ["user.info.basic,video.upload"]
+    assert q["redirect_uri"] == ["https://x/tiktok/callback"]
+    direct = TikTokClient("k", "s", "direct", "https://x", store, None)
+    assert "video.publish" in up.parse_qs(up.urlparse(direct.login_url()).query)["scope"][0]

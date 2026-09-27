@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import time
 import urllib.parse
@@ -29,7 +30,12 @@ log = logging.getLogger(__name__)
 AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 API = "https://open.tiktokapis.com/v2"
-SCOPES = "user.info.basic,video.upload,video.publish"
+# Autorisations demandées : uniquement celles du mode choisi. TikTok refuse toute la
+# connexion (« scope ») si on demande une autorisation non cochée dans l'app.
+SCOPES_BY_MODE = {
+    "inbox": "user.info.basic,video.upload",               # brouillons (Sandbox OK)
+    "direct": "user.info.basic,video.upload,video.publish",  # publication directe (app validée)
+}
 MAX_SINGLE_CHUNK = 64 * 1024 * 1024
 CHUNK = 10 * 1024 * 1024
 
@@ -61,7 +67,8 @@ class TikTokClient:
     def login_url(self) -> str:
         state = secrets.token_urlsafe(16)
         self.store.set("tiktok_oauth_state", state)
-        q = {"client_key": self.key, "scope": SCOPES, "response_type": "code",
+        scopes = os.getenv("TIKTOK_SCOPES") or SCOPES_BY_MODE.get(self.mode, SCOPES_BY_MODE["inbox"])
+        q = {"client_key": self.key, "scope": scopes, "response_type": "code",
              "redirect_uri": self.redirect_uri, "state": state}
         return AUTH_URL + "?" + urllib.parse.urlencode(q)
 

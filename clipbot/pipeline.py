@@ -223,10 +223,19 @@ class Pipeline:
             except Exception as e:  # une plateforme en panne ne bloque pas les autres
                 log.exception("Publication %s échouée", t)
                 report.append(f"{t.capitalize()} ⚠️ {e}")
-        status = "published" if ids else "failed"
-        self.store.update_clip(cid, status=status, publish_id=json.dumps(ids) if ids else None,
-                               error=None if ids else "; ".join(report)[:500])
-        await self.tg.send(f"Clip #{cid}\n" + "\n".join(report))
+        if ids:
+            self.store.update_clip(cid, status="published", publish_id=json.dumps(ids), error=None)
+            await self.tg.send(f"Clip #{cid}\n" + "\n".join(report))
+            return
+        # Échec partout (ex. limite de 5 brouillons TikTok atteinte) : le clip n'est pas
+        # perdu, il revient dans Telegram avec ses boutons pour réessayer plus tard.
+        self.store.update_clip(cid, status="ready", error="; ".join(report)[:500])
+        header = f"⚠️ #{cid} non publié — " + " / ".join(report)
+        mid = await self.tg.send_clip(cid, path, caption, header[:300])
+        if mid:
+            self.store.update_clip(cid, tg_message_id=mid)
+        else:
+            await self.tg.send(f"Clip #{cid}\n" + "\n".join(report))
 
     # ---------------------------------------------------------------- ménage
     async def run_janitor(self) -> None:

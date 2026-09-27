@@ -70,9 +70,15 @@ class App:
                     f"TikTok : {tt}\nYouTube : {yt}")
 
         async def auto(args):
+            # « /auto » seul bascule ; « /auto on » / « /auto off » forcent
             if args and args[0].lower() in ("on", "off"):
                 store.set("auto_publish", args[0].lower() == "on")
-            return f"Publication automatique : {'on' if self.pipeline.auto else 'off'}"
+            elif not args:
+                store.set("auto_publish", not self.pipeline.auto)
+            if self.pipeline.auto:
+                return ("Publication automatique : ON ✅\nChaque clip bien noté par l'IA part "
+                        "seul vers tes plateformes. /auto pour couper.")
+            return "Publication automatique : OFF — chaque clip attend ton ✅. /auto pour activer."
 
         async def pause(_):
             store.set("paused", True)

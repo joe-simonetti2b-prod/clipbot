@@ -427,3 +427,26 @@ def test_tiktok_login_requests_only_mode_scopes(tmp_path):
     assert q["redirect_uri"] == ["https://x/tiktok/callback"]
     direct = TikTokClient("k", "s", "direct", "https://x", store, None)
     assert "video.publish" in up.parse_qs(up.urlparse(direct.login_url()).query)["scope"][0]
+
+
+def test_failed_publish_returns_clip_to_telegram(tmp_path):
+    s = Settings()
+    s.capture.work_dir = tmp_path
+    store = Store(tmp_path / "f.db")
+    video = tmp_path / "c.mp4"
+    video.write_bytes(b"x")
+    cid = store.add_clip(platform="twitch", channel="x", reason="rire", score=6,
+                         final_path=str(video), caption="légende", status="publishing")
+
+    class BrokenTikTok:
+        mode, configured, connected = "inbox", True, True
+        async def publish(self, *a, **k):
+            from clipbot.tiktok import TikTokError
+            raise TikTokError("trop de brouillons en attente")
+
+    tg = FakeTelegram()
+    p = pipeline_mod.Pipeline(s, store, None, tg, BrokenTikTok())
+    asyncio.run(p._publish_everywhere(dict(store.clip(cid)), ["tiktok"]))
+    row = store.clip(cid)
+    assert row["status"] == "ready" and "brouillons" in row["error"]
+    assert tg.clips and tg.clips[0][0] == cid     # renvoyé avec ses boutons

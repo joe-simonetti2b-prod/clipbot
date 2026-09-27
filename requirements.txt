@@ -1,4 +1,5 @@
 aiohttp>=3.9,<4
+streamlink>=7  # capture Twitch sans les pubs
 yt-dlp>=2025.1.1
 faster-whisper>=1.1
 curl_cffi>=0.7  # API Kick (protégée par Cloudflare)

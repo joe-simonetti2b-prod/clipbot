@@ -707,7 +707,7 @@ def test_frozen_capture_is_restarted_in_ytdlp_mode(tmp_path):
         await asyncio.wait_for(task, 10)
         return rec
     rec = asyncio.run(scenario())
-    assert rec.mode == "pipe" and Frozen.spawns[0] == "direct"   # figée -> bascule yt-dlp
+    assert rec.mode == "pipe" and Frozen.spawns[0] == "streamlink"   # figée -> bascule yt-dlp
 
 
 def test_noisy_capture_process_does_not_block(tmp_path):
@@ -728,3 +728,19 @@ def test_noisy_capture_process_does_not_block(tmp_path):
         return p.returncode, list(rec._err_tail)
     code, tail = asyncio.run(scenario())
     assert code == 0 and tail and tail[-1].startswith("bruyant:")
+
+
+def test_single_growing_file_counts_as_frozen(tmp_path):
+    """Un seul fichier qui grossit sans nouveau découpage = capture figée."""
+    import time as _t
+    from datetime import datetime
+    from clipbot.config import CaptureConfig
+    from clipbot.models import StreamCandidate
+    from clipbot.recorder import SEG_FMT, StreamRecorder
+    rec = StreamRecorder(StreamCandidate(Platform.TWITCH, "x", "1", "u", "", "", 1),
+                         CaptureConfig(work_dir=tmp_path))
+    assert rec.mode == "streamlink"
+    old = datetime.fromtimestamp(_t.time() - 120).strftime(SEG_FMT)
+    f = rec.buffer_dir / f"seg_{old}.ts"
+    f.write_bytes(b"x")                     # écrit à l'instant, mais créé il y a 2 min
+    assert rec._last_write_age(started=_t.time() - 300) > 100

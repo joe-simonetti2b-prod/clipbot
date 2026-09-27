@@ -32,7 +32,7 @@ import aiohttp
 
 from .config import CaptureConfig, HypeConfig
 from .public import pick_variant
-from .models import HypeEvent, StreamCandidate
+from .models import Platform, HypeEvent, StreamCandidate
 
 log = logging.getLogger(__name__)
 
@@ -58,7 +58,9 @@ class StreamRecorder:
         self.buffer_dir = cfg.work_dir / "buffer" / _safe(candidate.key)
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
         self._procs: list[asyncio.subprocess.Process] = []
-        self.mode = "direct"
+        # Kick : flux HLS direct ; Twitch : Streamlink (retire les pubs) ; sinon yt-dlp
+        self.mode = ("direct" if candidate.hls_url else
+                     "streamlink" if candidate.platform is Platform.TWITCH else "pipe")
         self._err_tail: deque[str] = deque(maxlen=6)
         self._drains: list[asyncio.Future] = []
         self._stopping = False
@@ -108,13 +110,22 @@ class StreamRecorder:
             self._procs = [ffmpeg, ffmpeg]
             self._drain(ffmpeg, "ffmpeg")
             return
-        # Mode de secours : yt-dlp télécharge et envoie le flux à FFmpeg par un tuyau
+        # Streamlink (Twitch, pubs retirées) ou yt-dlp : flux envoyé à FFmpeg par un tuyau
         r_fd, w_fd = os.pipe()
-        ytdlp = await asyncio.create_subprocess_exec(
-            "yt-dlp", "--quiet", "--no-warnings", "--no-part",
-            "-f", self.cfg.stream_format, "-o", "-", self.c.url,
-            stdout=w_fd, stderr=asyncio.subprocess.PIPE,
-        )
+        if self.mode == "streamlink":
+            h = self.cfg.max_height
+            quality = f"{h}p60,{h}p,480p,best"
+            ytdlp = await asyncio.create_subprocess_exec(
+                "streamlink", "--stdout", "--loglevel", "warning",
+                "--stream-segment-threads", "1", self.c.url, quality,
+                stdout=w_fd, stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            ytdlp = await asyncio.create_subprocess_exec(
+                "yt-dlp", "--quiet", "--no-warnings", "--no-part",
+                "-f", self.cfg.stream_format, "-o", "-", self.c.url,
+                stdout=w_fd, stderr=asyncio.subprocess.PIPE,
+            )
         ffmpeg = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
             "-i", "pipe:0", *self._segment_args(),
@@ -123,7 +134,7 @@ class StreamRecorder:
         os.close(r_fd)
         os.close(w_fd)
         self._procs = [ytdlp, ffmpeg]
-        self._drain(ytdlp, "yt-dlp")
+        self._drain(ytdlp, self.mode)
         self._drain(ffmpeg, "ffmpeg")
 
     STALL_S = 40          # aucune vidéo écrite depuis 40 s = capture figée
@@ -143,7 +154,11 @@ class StreamRecorder:
     WATCH_EVERY_S = 10.0
 
     def _last_write_age(self, started: float) -> float:
-        newest = max((p.stat().st_mtime for p in self.buffer_dir.glob("seg_*.ts")), default=0.0)
+        """Âge du dernier morceau CRÉÉ. Un morceau naît toutes les ~6 s ; si le
+        découpage s'arrête (piste vidéo perdue après une pub), un seul fichier grossit
+        sans fin : on le détecte ici aussi."""
+        newest = max((t for p in self.buffer_dir.glob("seg_*.ts")
+                      if (t := _seg_start(p)) is not None), default=0.0)
         return time.time() - max(newest, started)
 
     async def run(self) -> None:
@@ -175,12 +190,12 @@ class StreamRecorder:
             err = " | ".join(self._err_tail)[-400:]
             self._err_tail.clear()
             short = time.time() - started < 120
-            if self.mode == "direct" and (stalled or short):
+            if self.mode in ("direct", "streamlink") and (stalled or short):
                 direct_fails += 1
                 if (stalled or direct_fails >= 2) and not self.c.hls_url:
-                    self.mode = "pipe"
-                    log.warning("Capture directe %s sur %s -> mode yt-dlp",
+                    log.warning("Capture %s %s sur %s -> mode yt-dlp", self.mode,
                                 "figée" if stalled else "instable", self.c.key)
+                    self.mode = "pipe"
             # Une coupure après une longue capture = jeton expiré ou micro-coupure.
             failures = failures + 1 if short else 0
             reason = "aucune vidéo depuis 40 s" if stalled else "arrêt"

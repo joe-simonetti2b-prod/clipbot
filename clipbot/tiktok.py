@@ -36,6 +36,12 @@ SCOPES_BY_MODE = {
     "inbox": "user.info.basic,video.upload",               # brouillons (Sandbox OK)
     "direct": "user.info.basic,video.upload,video.publish",  # publication directe (app validée)
 }
+# Facultatif : statistiques du compte + liste des vidéos publiées, pour suivre l'éligibilité
+# aux missions TikTok (Creator Rewards) et retrouver automatiquement le lien d'une vidéo une
+# fois publiée (utile pour les campagnes Whop). Ajoutées seulement si l'app les a activées
+# dans le portail développeur ; sinon TikTok refuse la connexion et on les retire tout seul
+# (voir note_auth_error) — pas besoin d'y toucher à la main dans ce cas.
+ANALYTICS_SCOPES = "user.info.stats,video.list"
 MAX_SINGLE_CHUNK = 64 * 1024 * 1024
 CHUNK = 10 * 1024 * 1024
 
@@ -72,10 +78,19 @@ class TikTokClient:
     def login_url(self) -> str:
         state = secrets.token_urlsafe(16)
         self.store.set("tiktok_oauth_state", state)
-        scopes = os.getenv("TIKTOK_SCOPES") or SCOPES_BY_MODE.get(self.mode, SCOPES_BY_MODE["inbox"])
+        override = os.getenv("TIKTOK_SCOPES")
+        scopes = override or SCOPES_BY_MODE.get(self.mode, SCOPES_BY_MODE["inbox"])
+        if not override and self.analytics:
+            scopes += "," + ANALYTICS_SCOPES
         q = {"client_key": self.key, "scope": scopes, "response_type": "code",
              "redirect_uri": self.redirect_uri, "state": state}
         return AUTH_URL + "?" + urllib.parse.urlencode(q)
+
+    @property
+    def analytics(self) -> bool:
+        # Coupé automatiquement si TikTok a déjà refusé ces scopes (évite de re-planter
+        # la connexion à chaque fois) ; /tiktok relance alors sans eux.
+        return self.analytics_wanted and self.store.get("tiktok_analytics_denied") != True
 
     async def check_credentials(self) -> tuple[bool | None, str]:
         """Vérifie la paire client key / secret auprès de TikTok (jeton « application »).

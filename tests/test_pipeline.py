@@ -422,12 +422,34 @@ def test_tiktok_credentials_check(tmp_path):
 def test_tiktok_login_requests_only_mode_scopes(tmp_path):
     import urllib.parse as up
     store = Store(tmp_path / "s.db")
-    inbox = TikTokClient("sbkey", "s", "inbox", "https://x", store, None)
+    # analytics=False isole ce test sur les scopes liés au mode (inbox/direct) ; le
+    # comportement des scopes d'analytics est couvert par le test suivant.
+    inbox = TikTokClient("sbkey", "s", "inbox", "https://x", store, None, analytics=False)
     q = up.parse_qs(up.urlparse(inbox.login_url()).query)
     assert q["scope"] == ["user.info.basic,video.upload"]
     assert q["redirect_uri"] == ["https://x/tiktok/callback"]
-    direct = TikTokClient("k", "s", "direct", "https://x", store, None)
+    direct = TikTokClient("k", "s", "direct", "https://x", store, None, analytics=False)
     assert "video.publish" in up.parse_qs(up.urlparse(direct.login_url()).query)["scope"][0]
+
+
+def test_tiktok_analytics_scopes_added_and_backed_off_on_denial(tmp_path):
+    import urllib.parse as up
+    from clipbot.tiktok import ANALYTICS_SCOPES
+    store = Store(tmp_path / "s2.db")
+    tt = TikTokClient("k", "s", "inbox", "https://x", store, None)  # analytics=True par défaut
+    assert tt.analytics is True
+    scope = up.parse_qs(up.urlparse(tt.login_url()).query)["scope"][0]
+    assert scope == "user.info.basic,video.upload," + ANALYTICS_SCOPES
+    # TikTok refuse (scope non activé sur l'app) -> se coupe tout seul pour la prochaine fois
+    assert tt.note_auth_error("invalid_scope: user.info.stats not enabled") is True
+    assert tt.analytics is False
+    scope2 = up.parse_qs(up.urlparse(tt.login_url()).query)["scope"][0]
+    assert scope2 == "user.info.basic,video.upload"
+    # Une erreur sans rapport avec les scopes ne désactive rien
+    tt2 = TikTokClient("k", "s", "inbox", "https://x", store, None)
+    store.set("tiktok_analytics_denied", False)
+    assert tt2.note_auth_error("access_denied: user cancelled") is False
+    assert tt2.analytics is True
 
 
 def test_failed_publish_returns_clip_to_telegram(tmp_path):

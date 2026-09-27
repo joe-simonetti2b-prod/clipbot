@@ -120,31 +120,52 @@ class StreamRecorder:
         os.close(w_fd)
         self._procs = [ytdlp, ffmpeg]
 
+    STALL_S = 40          # aucune vidéo écrite depuis 40 s = capture figée
+    WATCH_EVERY_S = 10.0
+
+    def _last_write_age(self, started: float) -> float:
+        newest = max((p.stat().st_mtime for p in self.buffer_dir.glob("seg_*.ts")), default=0.0)
+        return time.time() - max(newest, started)
+
     async def run(self) -> None:
-        """Boucle de supervision : relance en cas de coupure, abandonne si le live est fini.
-        La capture directe qui échoue deux fois de suite bascule en mode yt-dlp."""
+        """Boucle de supervision : relance en cas de coupure ou de capture figée,
+        abandonne si le live est fini. Capture directe instable -> mode yt-dlp."""
         failures = direct_fails = 0
         while not self._stopping and failures < 5:
             started = time.time()
             await self._spawn()
             self.alive.set()
             src, ffmpeg = self._procs
-            await ffmpeg.wait()
+            waiter = asyncio.ensure_future(ffmpeg.wait())
+            stalled = False
+            while not waiter.done():
+                await asyncio.wait({waiter}, timeout=self.WATCH_EVERY_S)
+                if not waiter.done() and self._last_write_age(started) > self.STALL_S:
+                    # FFmpeg tourne mais n'écrit plus rien (ex. pub Twitch mal gérée)
+                    stalled = True
+                    break
             await self._kill()
+            waiter.cancel()
             self.alive.clear()
             if self._stopping:
                 break
-            err = (await src.stderr.read()).decode(errors="ignore").strip()[-300:]
+            err = ""
+            if src.stderr and not stalled:
+                try:
+                    err = (await asyncio.wait_for(src.stderr.read(), 5)).decode(errors="ignore").strip()[-300:]
+                except asyncio.TimeoutError:
+                    pass
             short = time.time() - started < 120
-            if self.mode == "direct" and short:
+            if self.mode == "direct" and (stalled or short):
                 direct_fails += 1
-                if direct_fails >= 2 and not self.c.hls_url:
+                if (stalled or direct_fails >= 2) and not self.c.hls_url:
                     self.mode = "pipe"
-                    log.warning("Capture directe instable sur %s -> mode yt-dlp", self.c.key)
+                    log.warning("Capture directe %s sur %s -> mode yt-dlp",
+                                "figée" if stalled else "instable", self.c.key)
             # Une coupure après une longue capture = jeton expiré ou micro-coupure.
             failures = failures + 1 if short else 0
-            log.warning("Capture %s interrompue (%s) — tentative %d/5",
-                        self.c.key, err or "fin de flux", failures)
+            log.warning("Capture %s interrompue (%s) — tentative %d/5", self.c.key,
+                        "aucune vidéo depuis 40 s" if stalled else (err or "fin de flux"), failures)
             await asyncio.sleep(min(5 * failures, 30))
         log.info("Capture %s terminée", self.c.key)
 

@@ -679,3 +679,32 @@ def test_french_focus_outranks_bigger_us_stream():
     stop, start = plan_rotation({}, sorted([us1, us2, fr], key=lambda c: c.weight, reverse=True),
                                 2, 1.3, 600, now=0)
     assert [c.channel for c in start] == ["kamet0", "kaicenat"]
+
+
+def test_frozen_capture_is_restarted_in_ytdlp_mode(tmp_path):
+    """Capture qui tourne sans rien écrire (cas nico_la) : relancée, et bascule en yt-dlp."""
+    from clipbot.config import CaptureConfig
+    from clipbot.models import StreamCandidate
+    from clipbot.recorder import StreamRecorder
+
+    class Frozen(StreamRecorder):
+        STALL_S = 1.5
+        WATCH_EVERY_S = 0.3
+        spawns = []
+
+        async def _spawn(self):
+            Frozen.spawns.append(self.mode)
+            p = await asyncio.create_subprocess_exec("sleep", "30", stderr=asyncio.subprocess.PIPE)
+            self._procs = [p, p]
+
+    async def scenario():
+        c = StreamCandidate(Platform.TWITCH, "nico_la", "1", "https://www.twitch.tv/nico_la", "", "", 1)
+        rec = Frozen(c, CaptureConfig(work_dir=tmp_path, segment_s=2))
+        task = asyncio.create_task(rec.run())
+        await asyncio.sleep(4.5)
+        rec._stopping = True
+        await rec._kill()
+        await asyncio.wait_for(task, 10)
+        return rec
+    rec = asyncio.run(scenario())
+    assert rec.mode == "pipe" and Frozen.spawns[0] == "direct"   # figée -> bascule yt-dlp

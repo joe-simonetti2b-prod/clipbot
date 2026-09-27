@@ -121,6 +121,13 @@ class ProcessingConfig:
     channel_tags: dict[str, str] = field(default_factory=lambda: _parse_tags(os.getenv("CHANNEL_TAGS", "")))
     # Crédit discret incrusté en bas de la vidéo (« twitch.tv/xqc ») : attribution visible
     video_credit: bool = _env("VIDEO_CREDIT", "true", _bool)
+    # Tag du compte incrusté en petit sur chaque vidéo (ex : @clipclaptrap) ; /tag pour changer
+    watermark: str = _env("WATERMARK")
+    # Fin de vidéo (~1,8 s) avec boutons « S'abonner » et « Partager » ; /outro on|off
+    outro: bool = _env("OUTRO", "true", _bool)
+    # Clips postés par les viewers dans le chat + meilleurs clips Twitch du jour
+    viewer_clips: bool = _env("VIEWER_CLIPS", "true", _bool)
+    top_clips: bool = _env("TOP_CLIPS", "true", _bool)
 
 
 @dataclass

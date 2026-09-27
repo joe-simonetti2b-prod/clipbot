@@ -45,6 +45,9 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(clips)")}
+        if "peak_at" not in cols:   # moment fort (s depuis le début du clip) : flash au montage
+            self.db.execute("ALTER TABLE clips ADD COLUMN peak_at REAL")
         # Au redémarrage, un clip resté « en cours » est remis dans la file.
         self.db.execute("UPDATE clips SET status='extracted' WHERE status='processing'")
         self.db.execute("UPDATE clips SET status='approved' WHERE status='publishing'")

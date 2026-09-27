@@ -5,6 +5,7 @@ démarrage/arrêt propre du service complet.
 """
 import asyncio
 import json
+import re
 import os
 import signal
 import subprocess
@@ -117,7 +118,7 @@ def test_full_pipeline_to_validation(tmp_path, source_video, monkeypatch):
             assert not raw.exists()  # le brut est supprimé après montage
             assert tg.clips and "🎥 demo en live sur Twitch" in tg.clips[0][2]
             assert "@demo #democlips" in tg.clips[0][2]  # mentions de campagne
-            assert float(probe(Path(row["final_path"]))["format"]["duration"]) == pytest.approx(8, abs=0.2)
+            assert float(probe(Path(row["final_path"]))["format"]["duration"]) == pytest.approx(8 + 1.8, abs=0.2)  # + outro
             # Validation depuis Telegram, puis un double appui est ignoré
             assert "Validé" in await p.approve(cid)
             assert await p.approve(cid) == "Déjà traité"
@@ -788,3 +789,79 @@ def test_streamlink_ad_break_not_a_stall(tmp_path):
     # Pub annoncée par Streamlink : tolérée pendant sa durée
     r._note_ad("[plugins.twitch][info] Detected advertisement break of 90 seconds")
     assert not r._is_stalled(now - 200)
+
+
+# ---------------------------------------------------------------- v3 : choix manuel, montage
+def test_rotation_pinned_channels_take_and_keep_their_slot():
+    from clipbot.watcher import plan_rotation
+    a, b, small = _cand("a", 50000), _cand("b", 20000), _cand("small", 800)
+    watched = {"twitch:a-1": (a, 0), "twitch:b-1": (b, 0)}
+    live = [a, b, small]
+    # Choix manuel d'un petit live : il remplace le plus faible non choisi, immédiatement
+    stop, start = plan_rotation(watched, live, 2, 1.3, 600, now=10, pinned={"small"})
+    assert stop == ["twitch:b-1"] and [c.channel for c in start] == ["small"]
+    # Une fois suivi, un choix manuel n'est jamais remplacé par la rotation
+    watched = {"twitch:a-1": (a, 0), "twitch:small-1": (small, 0)}
+    huge = _cand("huge", 900000)
+    stop, start = plan_rotation(watched, [huge, a, small], 2, 1.3, 600, now=5000, pinned={"small"})
+    assert stop == ["twitch:a-1"] and [c.channel for c in start] == ["huge"]
+    # Deux choix manuels : l'algorithme n'a plus de place
+    stop, start = plan_rotation(watched, [huge, a, small], 2, 1.3, 600, now=5000,
+                                pinned={"small", "a"})
+    assert (stop, start) == ([], [])
+    # Choix manuel hors ligne : la place reste à l'algorithme
+    stop, start = plan_rotation({}, [huge, a], 2, 1.3, 600, now=0, pinned={"offline"})
+    assert [c.channel for c in start] == ["huge", "a"]
+
+
+def test_clip_links_and_ids():
+    from clipbot.harvest import accept_owner, clip_id
+    from clipbot.watcher import find_clip_links
+    links = find_clip_links("mdr https://clips.twitch.tv/FunnyCat-AbC123 et "
+                            "https://www.twitch.tv/nico_la/clip/Slug-XyZ789 "
+                            "https://kick.com/adinross?clip=clip_01JABC pas ça https://twitch.tv/nico_la")
+    assert len(links) == 3
+    assert clip_id(links[0]) == "funnycat-abc123" and clip_id(links[2]) == "clip_01jabc"
+    assert accept_owner({"uploader": "Nico_la"}, {"nico_la"})
+    assert not accept_owner({"uploader": "random"}, {"nico_la"})
+    assert accept_owner({}, {"nico_la"})
+
+
+def test_subtitles_pacing_and_overlays():
+    from clipbot.subtitles import SUB_LEAD, chunk_times
+    chunks = chunk_words(WORDS)
+    times = chunk_times(chunks, 8)
+    # jamais deux bouts à l'écran en même temps, légère avance sur la voix
+    assert all(times[i][1] <= times[i + 1][0] + 1e-9 for i in range(len(times) - 1))
+    assert times[0][0] == pytest.approx(0.2 - SUB_LEAD)
+    assert all(e - s >= 0.45 - 1e-9 for s, e in times[:-1] if True)
+    ass = build_ass(WORDS, "Hook", "face", 8, keywords=["incroyable"], cover="IL CRAQUE",
+                    creator="nico_la", watermark="@clipclaptrap", outro_s=1.8, peak_at=3.0)
+    assert "IL CRAQUE" in ass and "NICO_LA" in ass and "@clipclaptrap" in ass
+    assert "S'ABONNER" in ass and "PARTAGER" in ass
+    assert "\\c&H0066FF33&}INCROYABLE" in ass or "INCROYABLE" in ass
+    # sous-titres traduits : bouts de phrase entiers, pas de karaoké mot à mot
+    tr = build_ass(WORDS, "", "blur", 8, karaoke=False)
+    assert "\\c&H0000FFFF&" not in tr and tr.count("Dialogue: 0") < len(WORDS)
+
+
+def test_render_outro_and_av_sync(tmp_path):
+    """Son qui démarre 0,5 s après l'image dans le live : le bip et le flash restent calés."""
+    src = tmp_path / "late.ts"
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+         "color=black:s=640x360:r=30:d=9,drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:"
+         "enable='between(t,4.5,4.7)'",
+         "-itsoffset", "1.5", "-f", "lavfi", "-i",
+         "aevalsrc='if(between(t,3,3.2),sin(2*PI*1000*t),0)':s=48000:d=8",
+         "-c:v", "libx264", "-preset", "ultrafast", "-g", "30", "-c:a", "aac", "-f", "mpegts",
+         str(src)], check=True)
+    out = tmp_path / "o.mp4"
+    assert asyncio.run(render(src, 1.0, 6.0, Layout("blur"), build_ass([], "", "blur", 6),
+                              out, height=640, preset="ultrafast", threads=1, outro_s=1.5))
+    assert float(probe(out)["format"]["duration"]) == pytest.approx(7.5, abs=0.15)
+    sil = subprocess.run(["ffmpeg", "-hide_banner", "-i", str(out), "-af",
+                          "silencedetect=n=-30dB:d=0.1", "-vn", "-f", "null", "-"],
+                         capture_output=True, text=True).stderr
+    beep = float(re.search(r"silence_end: ([\d.]+)", sil).group(1))
+    assert beep == pytest.approx(3.5, abs=0.1)

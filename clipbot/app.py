@@ -19,6 +19,7 @@ from aiohttp import web
 
 from .config import Settings
 from .discovery import parse_spec
+from .harvest import ClipHarvester
 from .models import HypeEvent, StreamCandidate
 from .pipeline import Pipeline
 from .recorder import RawClip
@@ -45,7 +46,7 @@ class App:
             platform=c.platform.value, channel=c.channel, stream_url=c.url,
             stream_title=c.title, category=c.category, reason=ev.reason, score=ev.score,
             tokens=", ".join(ev.top_tokens), raw_path=str(raw.path),
-            trim_offset=raw.offset, trim_duration=raw.duration,
+            trim_offset=raw.offset, trim_duration=raw.duration, peak_at=raw.peak_at,
         )
         self.pipeline.wake()
 
@@ -90,6 +91,89 @@ class App:
             self.pipeline._publish_wake.set()
             return (f"🚀 J'envoie les {n} clips en file vers TikTok." if n
                     else "Aucun clip en file d'attente.")
+
+        # ---------------- choix manuel des lives (l'algorithme garde les places libres)
+        def pins() -> list[str]:
+            return [parse_spec(p)[1] for p in store.get("pinned_channels", [])]
+
+        def lives_menu(note: str = "") -> tuple[str, list]:
+            pinned = set(pins())
+            watching = {w.c.channel.lower() for w in self.orch.watchers.values()}
+            rows, seen = [], set()
+            for c in self.orch.last_live:
+                n = c.channel.lower()
+                if n in seen:
+                    continue
+                seen.add(n)
+                mark = "📌" if n in pinned else "👁" if n in watching else "▫️"
+                v = f"{c.viewers / 1000:.1f}k" if c.viewers >= 1000 else str(c.viewers)
+                rows.append([(f"{mark} {c.channel} · {v} ({c.platform.value})", f"pin:{n}")])
+                if len(rows) >= 14:
+                    break
+            rows.append([("🤖 Tout en automatique", "pin:*")])
+            offline = [p for p in pinned if p not in seen]
+            limit = self.s.discovery.max_concurrent_streams
+            text = ((note + "\n\n") if note else "") + (
+                f"Lives en cours ({len(seen)}) — 📌 choisi par toi · 👁 suivi en ce moment\n"
+                f"Touche un live pour le suivre à coup sûr (max {limit}), retouche pour l'enlever. "
+                "Les places non choisies restent gérées par l'algorithme.")
+            if offline:
+                text += f"\n📌 Hors ligne, suivi dès son live : {', '.join(offline)}"
+            return text, rows
+
+        async def pin_cb(arg: str):
+            cur = pins()
+            limit = self.s.discovery.max_concurrent_streams
+            if arg == "*":
+                store.set("pinned_channels", [])
+                note = "🤖 Retour au 100 % automatique."
+            elif arg in cur:
+                store.set("pinned_channels", [p for p in cur if p != arg])
+                note = f"➖ {arg} n'est plus forcé."
+            else:
+                cur = (cur + [arg])[-limit:]
+                store.set("pinned_channels", cur)
+                note = f"📌 {arg} sera suivi (bascule en cours, ~20 s)."
+            self.orch.rescan()
+            return lives_menu(note)
+        tg.callbacks["pin"] = pin_cb
+
+        async def lives(_):
+            text, rows = lives_menu()
+            await tg.send_menu(text, rows)
+            return ""
+
+        async def suivre(args):
+            if not args:
+                return await lives(args)
+            names = [parse_spec(a)[1] for a in args][: self.s.discovery.max_concurrent_streams]
+            store.set("pinned_channels", names)
+            self.orch.rescan()
+            return (f"📌 Suivi forcé : {', '.join(names)} (dès qu'ils sont en live).\n"
+                    "/algo pour rendre la main à l'algorithme.")
+
+        async def algo(_):
+            store.set("pinned_channels", [])
+            self.orch.rescan()
+            return "🤖 Les lives suivis sont de nouveau choisis par l'algorithme."
+
+        async def tag(args):
+            if args:
+                val = "" if args[0].lower() in ("off", "non", "aucun") else args[0]
+                if val and not val.startswith("@"):
+                    val = "@" + val
+                store.set("watermark", val)
+            cur = self.pipeline.watermark
+            return (f"Tag incrusté sur les vidéos : {cur}" if cur else
+                    "Aucun tag incrusté. /tag @toncompte pour en mettre un.")
+
+        async def outro(args):
+            if args and args[0].lower() in ("on", "off"):
+                store.set("outro", args[0].lower() == "on")
+            elif not args:
+                store.set("outro", not self.pipeline.outro)
+            return ("Fin de vidéo « S'abonner / Partager » : " +
+                    ("ON ✅ (1,8 s)" if self.pipeline.outro else "OFF"))
 
         async def pause(_):
             store.set("paused", True)
@@ -165,7 +249,8 @@ class App:
                     f"?k={self.s.publish.telegram_pair_code}")
 
         tg.commands.update({"status": status, "auto": auto, "pause": pause, "resume": resume,
-                            "add": add, "remove": remove, "chaines": chaines, "tiktok": tiktok, "youtube": youtube, "relance": relance})
+                            "add": add, "remove": remove, "chaines": chaines, "tiktok": tiktok, "youtube": youtube, "relance": relance,
+                            "lives": lives, "suivre": suivre, "algo": algo, "tag": tag, "outro": outro})
 
     # ------------------------------------------------------ exécution
     async def run(self) -> None:
@@ -195,6 +280,13 @@ class App:
             self.pipeline = Pipeline(self.s, self.store, session, self.tg, self.tiktok, self.youtube)
             self.orch = Orchestrator(self.s, self.store, session, self._on_clip)
             self.orch.notify = lambda text: asyncio.create_task(self.tg.send("🔎 " + text))
+            p = self.s.processing
+            self.harvester = ClipHarvester(
+                self.store, session, self.s.capture.work_dir, on_new=self.pipeline.wake,
+                allowed=lambda: {n for _, n in self.orch.scanner.targets()},
+                top_channels=self._top_channels, enabled_top=p.top_clips)
+            if p.viewer_clips:
+                self.orch.on_link = self.harvester.offer
             self._register_commands()
 
             runner = web.AppRunner(build_app(self))
@@ -210,6 +302,7 @@ class App:
                 ("telegram", self.tg.run()),
                 ("keepalive", self._keepalive(session)),
                 ("backup", self.backup.run()),
+                ("harvester", self.harvester.run()),
             )]
             self._log_config()
             await self.tg.send("🟢 clipbot démarré. /status")
@@ -224,6 +317,16 @@ class App:
             await asyncio.gather(*tasks, return_exceptions=True)
             await self.orch.stop_all()
             await runner.cleanup()
+
+    def _top_channels(self) -> list[str]:
+        """Créateurs Twitch dont on récupère les meilleurs clips du jour :
+        les lives suivis, les choix manuels, puis les créateurs « focus »."""
+        from .models import Platform
+        tw = {n for p, n in self.orch.scanner.targets() if p is Platform.TWITCH}
+        out = [w.c.channel for w in self.orch.watchers.values() if w.c.platform is Platform.TWITCH]
+        out += [n for n in self.orch.pinned() if n in tw]
+        out += [parse_spec(f)[1] for f in self.s.discovery.focus_channels if parse_spec(f)[1] in tw]
+        return list(dict.fromkeys(out))
 
     async def _check_tiktok(self) -> None:
         if not self.tiktok.configured:

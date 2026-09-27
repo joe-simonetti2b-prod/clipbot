@@ -268,6 +268,7 @@ class RawClip:
     path: Path
     offset: float      # début utile dans le fichier (s)
     duration: float    # durée utile (s)
+    peak_at: float | None = None   # moment fort, en s depuis le début du clip
 
 
 class ClipExtractor:
@@ -327,6 +328,7 @@ class ClipExtractor:
             out = base.with_suffix(".ts")
             args = ["-c", "copy"]
             trim = RawClip(out, offset, duration)
+        trim.peak_at = round((ev.peak_ts - self.hype.chat_delay_s) - max(t0, first_ts), 2)
 
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                "-f", "concat", "-safe", "0", "-i", str(concat_list), *args, str(out)]

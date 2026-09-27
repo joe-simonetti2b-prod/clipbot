@@ -7,6 +7,8 @@ Télécommande Telegram : ton tableau de bord depuis le téléphone.
   /pause /resume  arrêter / reprendre la surveillance des lives
   /add <chaîne>   suivre une chaîne (ex : /add kamet0  ou  /add kick:xxx)
   /remove <chaîne>, /chaines
+  /lives          choisir à la main les lives suivis (boutons) ; /algo pour revenir
+  /tag @pseudo    tag incrusté sur les vidéos ; /outro on|off
   /tiktok         lien de connexion TikTok (une seule fois)
   /youtube        lien de connexion YouTube Shorts (une seule fois)
 
@@ -30,6 +32,10 @@ log = logging.getLogger(__name__)
 Handler = Callable[[list[str]], Awaitable[str]]
 
 
+def _keyboard(rows: list[list[tuple[str, str]]]) -> list[list[dict]]:
+    return [[{"text": t[:60], "callback_data": d[:64]} for t, d in row] for row in rows if row]
+
+
 class TelegramBot:
     def __init__(self, token: str, pair_code: str, store: Store, session: aiohttp.ClientSession,
                  owner_id: str = ""):
@@ -42,6 +48,8 @@ class TelegramBot:
         self.commands: dict[str, Handler] = {}
         self.on_approve: Callable[[int], Awaitable[str]] | None = None
         self.on_reject: Callable[[int], Awaitable[str]] | None = None
+        # Autres boutons : {"préfixe": handler(argument) -> (texte, nouveau clavier | None)}
+        self.callbacks: dict[str, Callable[[str], Awaitable[tuple[str, list | None]]]] = {}
 
     @property
     def owner(self) -> int | None:
@@ -64,6 +72,17 @@ class TelegramBot:
             await self._call("sendMessage", json={
                 "chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True,
             })
+        except Exception as e:
+            log.warning("Envoi Telegram impossible : %s", e)
+
+    async def send_menu(self, text: str, rows: list[list[tuple[str, str]]]) -> None:
+        """Message avec boutons : rows = [[(libellé, données), …], …]."""
+        if not (self.enabled and self.owner):
+            return
+        try:
+            await self._call("sendMessage", json={
+                "chat_id": self.owner, "text": text[:4000], "disable_web_page_preview": True,
+                "reply_markup": {"inline_keyboard": _keyboard(rows)}})
         except Exception as e:
             log.warning("Envoi Telegram impossible : %s", e)
 
@@ -102,6 +121,8 @@ class TelegramBot:
                 ("chaines", "Chaînes suivies"), ("tiktok", "Connecter TikTok"),
                 ("youtube", "Connecter YouTube Shorts"),
                 ("relance", "Renvoyer la file vers TikTok"),
+                ("lives", "Choisir les lives suivis"), ("algo", "Lives choisis par l'algorithme"),
+                ("tag", "Tag incrusté sur les vidéos"), ("outro", "on/off fin avec S'abonner"),
             ]]})
         offset = self.store.get("telegram_offset", 0)
         while True:
@@ -130,6 +151,18 @@ class TelegramBot:
             if cq["from"]["id"] != self.owner:
                 return
             action, _, cid = cq.get("data", "").partition(":")
+            if action in self.callbacks:
+                text, rows = await self.callbacks[action](cid)
+                await self._call("answerCallbackQuery", json={"callback_query_id": cq["id"],
+                                                             "text": text[:190]})
+                try:
+                    await self._call("editMessageText", json={
+                        "chat_id": cq["message"]["chat"]["id"],
+                        "message_id": cq["message"]["message_id"], "text": text[:4000],
+                        "reply_markup": {"inline_keyboard": _keyboard(rows or [])}})
+                except Exception:
+                    pass   # message identique : Telegram refuse la modification, sans gravité
+                return
             if action not in ("pub", "rej"):
                 await self._call("answerCallbackQuery", json={"callback_query_id": cq["id"]})
                 return
@@ -170,4 +203,6 @@ class TelegramBot:
         if chat_id != self.owner:
             return  # le bot n'obéit qu'à toi
         handler = self.commands.get(cmd)
-        await self.send(await handler(args) if handler else "Commande inconnue. /status", chat_id)
+        reply = await handler(args) if handler else "Commande inconnue. /status"
+        if reply:
+            await self.send(reply, chat_id)

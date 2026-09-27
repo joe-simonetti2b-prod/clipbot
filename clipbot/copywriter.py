@@ -28,7 +28,11 @@ REASON_HOOK = {
     "action": "Le moment où tout le chat a explosé 🔥",
     "demande_clip": "Le chat a crié « CLIP ! » 🎬",
     "burst": "Regarde jusqu'à la fin 👀",
+    "clip_viewer": "Le moment que tout le chat a clippé 🎬",
+    "top_clip": "Le clip le plus vu du jour 🏆",
 }
+REASON_COVER = {"rire": "FOU RIRE", "action": "IL EXPLOSE", "demande_clip": "CLIP !",
+                "burst": "INCROYABLE", "clip_viewer": "LE MOMENT", "top_clip": "LE CLIP DU JOUR"}
 
 PROMPT = """Tu es éditeur de clips courts viraux (TikTok/Shorts) pour du streaming, du sport et de l'entertainment.
 
@@ -45,6 +49,8 @@ Réponds UNIQUEMENT avec un objet JSON, en {lang} :
 {{
   "score": entier 1-10 (le clip est-il compréhensible et captivant SANS contexte ? 10 = viral évident, 1 = rien ne se passe),
   "hook": "accroche de 4 à 9 mots affichée en haut de la vidéo, qui donne envie de rester sans spoiler la chute",
+  "cover": "titre de miniature de 2 à 4 mots, choc et intrigant (ex : IL CRAQUE EN LIVE), sans emoji",
+  "keywords": ["2 à 4 mots forts prononcés dans la transcription (dans la langue des sous-titres), à surligner"],
   "caption": "légende de 1 à 2 phrases, naturelle, qui pousse au commentaire",
   "hashtags": ["5 à 7 hashtags pertinents, sans #, mélange niche + large"]
 }}"""
@@ -55,6 +61,8 @@ class Copy:
     hook: str
     caption: str
     score: int | None
+    cover: str = ""
+    keywords: tuple[str, ...] = ()
 
 
 def _finalize(body: str, hashtags: list[str], channel: str, platform: str,
@@ -77,7 +85,8 @@ def fallback_copy(clip: dict, cta: str, ad: bool) -> Copy:
     cat = re.sub(r"[^\w]", "", (clip.get("category") or "").lower())
     tags = [t for t in (cat, clip.get("channel", ""), "clip", "stream", "pourtoi", "fyp") if t]
     body = title[:150] if title else hook
-    return Copy(hook, _finalize(body, tags, clip["channel"], clip["platform"], cta, ad), None)
+    return Copy(hook, _finalize(body, tags, clip["channel"], clip["platform"], cta, ad), None,
+                cover=REASON_COVER.get(clip.get("reason"), "INCROYABLE"))
 
 
 LANG_NAMES = {"fr": "français", "en": "anglais", "es": "espagnol", "de": "allemand",
@@ -106,6 +115,10 @@ async def write_copy(session: aiohttp.ClientSession, llm: LLM, clip: dict, trans
             caption=_finalize(str(obj.get("caption", "")), list(obj.get("hashtags", []))[:8],
                               clip["channel"], clip["platform"], cta, ad),
             score=max(1, min(10, int(obj.get("score", 5)))),
+            cover=(re.sub(r"[^\w\s'!?-]", "", str(obj.get("cover") or "")).strip()[:32]
+                   or REASON_COVER.get(clip.get("reason"), "INCROYABLE")),
+            keywords=tuple(str(k)[:30] for k in (obj.get("keywords") or [])[:4]
+                           if isinstance(k, str)),
         )
     except (TypeError, ValueError):
         return fallback_copy(clip, cta, ad)

@@ -22,7 +22,8 @@ import os
 log = logging.getLogger(__name__)
 
 PERSISTED = ("tiktok_tokens", "youtube_tokens", "auto_publish", "paused",
-             "extra_channels", "telegram_owner", "youtube_quota")
+             "extra_channels", "telegram_owner", "youtube_quota",
+             "pinned_channels", "watermark", "outro")
 HEADER = "💾 Sauvegarde clipbot — ne pas supprimer ni désépingler\n"
 
 

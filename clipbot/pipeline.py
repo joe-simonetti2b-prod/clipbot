@@ -35,7 +35,9 @@ from .transcribe import transcribe
 
 log = logging.getLogger(__name__)
 
-EMOJI = {"rire": "😂", "action": "🔥", "demande_clip": "🎬", "burst": "⚡"}
+EMOJI = {"rire": "😂", "action": "🔥", "demande_clip": "🎬", "burst": "⚡",
+         "clip_viewer": "📎", "top_clip": "🏆"}
+OUTRO_S = 1.8
 
 
 class Pipeline:
@@ -86,6 +88,15 @@ class Pipeline:
                     Path(row["raw_path"]).unlink(missing_ok=True)
                 self.store.update_clip(row["id"], raw_path=None)
                 log.info("Clip %s abandonné (file pleine, score %.1f)", row["id"], row["score"] or 0)
+
+    @property
+    def watermark(self) -> str:
+        w = self.store.get("watermark")        # /tag depuis Telegram prime sur WATERMARK
+        return self.s.processing.watermark if w is None else w
+
+    @property
+    def outro(self) -> bool:
+        return self.store.get("outro", self.s.processing.outro)
 
     @property
     def auto(self) -> bool:
@@ -174,10 +185,14 @@ class Pipeline:
         out = self.final_dir / f"clip_{cid}.mp4"
         domain = {"twitch": "twitch.tv", "kick": "kick.com"}.get(clip["platform"], "")
         credit = f"{domain}/{clip['channel']}" if (p.video_credit and domain) else ""
-        ass = build_ass(words, copy.hook, layout.kind, duration, p.font, credit)
+        outro_s = OUTRO_S if self.outro else 0.0
+        ass = build_ass(words, copy.hook, layout.kind, duration, p.font, credit,
+                        karaoke=not translated, keywords=copy.keywords, cover=copy.cover,
+                        creator=clip["channel"], watermark=self.watermark, outro_s=outro_s,
+                        peak_at=clip.get("peak_at"))
         if not await render(src, offset, duration, layout, ass, out,
                             height=p.output_height, preset=p.x264_preset,
-                            threads=p.ffmpeg_threads):
+                            threads=p.ffmpeg_threads, outro_s=outro_s):
             raise RuntimeError("montage FFmpeg échoué")
 
         src.unlink(missing_ok=True)  # le brut ne sert plus
@@ -192,7 +207,8 @@ class Pipeline:
             return
         header = (f"{EMOJI.get(clip['reason'], '⚡')} #{cid} · {clip['channel']} "
                   f"({clip['platform']}) · {duration:.0f}s"
-                  + (f" · IA {copy.score}/10" if copy.score is not None else ""))
+                  + (f" · IA {copy.score}/10" if copy.score is not None else "")
+                  + (f"\n{clip['tokens']}" if clip["reason"] in ("clip_viewer", "top_clip") else ""))
         mid = await self.tg.send_clip(cid, out, copy.caption, header)
         if mid:
             self.store.update_clip(cid, tg_message_id=mid)

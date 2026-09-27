@@ -52,7 +52,12 @@ def _extract_audio(src: Path, offset: float, duration: float, dst: Path, codec: 
     subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-threads", "1",
          "-ss", f"{offset:.2f}", "-t", f"{duration:.2f}", "-i", str(src),
-         "-vn", "-ac", "1", "-ar", "16000", *codec, str(dst)],
+         # Même zéro que le montage : la piste vidéo (copiée vers nulle part, ~0 CPU)
+         # sert de repère, et le son est complété par du silence s'il démarre après
+         # l'image. Sans ça, les mots seraient décalés des lèvres.
+         "-map", "0:v:0?", "-c", "copy", "-f", "null", "-",
+         "-map", "0:a:0", "-af", "aresample=async=1:first_pts=0", "-ac", "1", "-ar", "16000",
+         *codec, str(dst)],
         check=True,
     )
 

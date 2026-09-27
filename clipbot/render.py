@@ -6,8 +6,11 @@ Taille de sortie réglable (OUTPUT_HEIGHT) : 1080×1920 par défaut, 720×1280
 sur les petites machines gratuites (≈ 2,2× moins de calcul). Les sous-titres
 ASS sont écrits pour 1080×1920 ; libass les met à l'échelle tout seul.
 
-Les horodatages sont remis à zéro (setpts) : les segments de live (MPEG-TS)
-ne commencent jamais à 0 ; sans ça, le filtre fps allonge la vidéo.
+Synchronisation son/image (lèvres) : image ET son sont calés sur le MÊME zéro,
+l'instant de début du clip (fps start_time=0, aresample first_pts=0). Remettre
+chaque piste à zéro séparément (ancienne méthode) décalait le son de l'image dès
+que les deux pistes du live ne démarraient pas au même instant.
+Fin de vidéo : la dernière image est figée (tpad) pendant l'outro, le son se tait.
 Débit plafonné (~4,5 Mb/s) pour rester sous la limite de 50 Mo de Telegram.
 """
 from __future__ import annotations
@@ -25,9 +28,10 @@ def _even(x: float) -> int:
     return int(round(x / 2)) * 2
 
 
-def build_filter(layout: Layout, ass_path: Path, height: int = 1920) -> str:
+def build_filter(layout: Layout, ass_path: Path, height: int = 1920, outro_s: float = 0.0) -> str:
+    pad = f"tpad=stop_mode=clone:stop_duration={outro_s:.2f}," if outro_s > 0 else ""
     return _layout_filter(layout, ass_path, height).replace(
-        "[0:v]", "[0:v]setpts=PTS-STARTPTS,", 1)
+        "fps=30,", f"fps=30:start_time=0,{pad}", 1)
 
 
 def _layout_filter(layout: Layout, ass_path: Path, H: int) -> str:
@@ -63,7 +67,11 @@ def _layout_filter(layout: Layout, ass_path: Path, H: int) -> str:
 
 async def render(src: Path, offset: float, duration: float, layout: Layout,
                  ass_text: str, out: Path, height: int = 1920, preset: str = "veryfast",
-                 threads: int = 2) -> bool:
+                 threads: int = 2, outro_s: float = 0.0) -> bool:
+    total = duration + max(outro_s, 0.0)
+    afilter = "aresample=async=1:first_pts=0,loudnorm=I=-14:TP=-1.5:LRA=11"
+    if outro_s > 0:
+        afilter += f",apad=pad_dur={outro_s:.2f}"
     ass_path = out.with_suffix(".ass")
     ass_path.write_text(ass_text, encoding="utf-8")
     cmd = [
@@ -73,10 +81,10 @@ async def render(src: Path, offset: float, duration: float, layout: Layout,
         *(["-threads", str(threads)] if threads > 0 else []),
         "-ss", f"{offset:.2f}", "-t", f"{duration:.2f}", "-i", str(src),
         *(["-filter_complex_threads", str(threads)] if threads > 0 else []),
-        "-filter_complex", build_filter(layout, ass_path, height),
+        "-filter_complex", build_filter(layout, ass_path, height, outro_s),
         "-map", "[v]", "-map", "0:a:0?",
-        "-af", "asetpts=PTS-STARTPTS,loudnorm=I=-14:TP=-1.5:LRA=11",
-        "-t", f"{duration:.2f}",  # borne de sortie : durée exacte garantie
+        "-af", afilter,
+        "-t", f"{total:.2f}",  # borne de sortie : durée exacte garantie
         "-c:v", "libx264", "-preset", preset, "-crf", "21",
         *(["-threads", str(threads)] if threads > 0 else []),
         "-maxrate", "4500k", "-bufsize", "9000k", "-pix_fmt", "yuv420p",

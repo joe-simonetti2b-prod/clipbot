@@ -744,3 +744,27 @@ def test_single_growing_file_counts_as_frozen(tmp_path):
     f = rec.buffer_dir / f"seg_{old}.ts"
     f.write_bytes(b"x")                     # écrit à l'instant, mais créé il y a 2 min
     assert rec._last_write_age(started=_t.time() - 300) > 100
+
+
+def test_tiktok_pending_limit_keeps_clip_queued(tmp_path):
+    s = Settings()
+    s.capture.work_dir = tmp_path
+    store = Store(tmp_path / "q.db")
+    video = tmp_path / "c.mp4"
+    video.write_bytes(b"x")
+    ids = [store.add_clip(platform="twitch", channel="x", reason="rire", score=6, ai_score=a,
+                          final_path=str(video), caption="c", status="publishing") for a in (5, 8)]
+
+    class FullTikTok:
+        mode, configured, connected = "inbox", True, True
+        async def publish(self, *a, **k):
+            from clipbot.tiktok import TikTokError
+            raise TikTokError("/post/publish/inbox/video/init/ : spam_risk_too_many_pending_share")
+
+    tg = FakeTelegram()
+    p = pipeline_mod.Pipeline(s, store, None, tg, FullTikTok())
+    for cid in ids:
+        asyncio.run(p._publish_everywhere(dict(store.clip(cid)), ["tiktok"]))
+    assert all(store.clip(c)["status"] == "approved" for c in ids)   # en file, pas perdus
+    assert p.tiktok_full_until > 0 and len(tg.messages) == 1 and not tg.clips
+    assert store.next_clip("approved")["ai_score"] == 8              # le meilleur passe d'abord

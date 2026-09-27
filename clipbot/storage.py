@@ -84,6 +84,10 @@ class Store:
     def next_clip(self, status: str, avoid_channel: str | None = None) -> sqlite3.Row | None:
         """Meilleur clip en attente ; si possible d'un autre créateur que `avoid_channel`
         (alternance : chaque créateur suivi a ses clips)."""
+        if status == "approved":   # à publier : d'abord les mieux notés par l'IA
+            return self.db.execute(
+                "SELECT * FROM clips WHERE status='approved' "
+                "ORDER BY COALESCE(ai_score, 0) DESC, score DESC, created LIMIT 1").fetchone()
         return self.db.execute(
             "SELECT * FROM clips WHERE status=? ORDER BY (channel IS ? ) ASC, score DESC, created "
             "LIMIT 1", (status, avoid_channel)

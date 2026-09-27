@@ -60,6 +60,9 @@ class App:
                               f"{w.clips} clips)" for w in self.orch.watchers.values()) or "  aucun"
             tt = ("non configuré" if not self.tiktok.configured else
                   f"connecté ({self.tiktok.mode})" if self.tiktok.connected else "à connecter → /tiktok")
+            if time.time() < self.pipeline.tiktok_full_until:
+                tt += (f"\n  🟡 5 vidéos en attente dans TikTok (publie-les) · "
+                       f"{self.pipeline.waiting_count()} clips en file")
             yt = ("non configuré" if not self.youtube.configured else
                   "connecté" if self.youtube.connected else "à connecter → /youtube")
             return (f"{'⏸️ EN PAUSE' if self.orch.paused else '🟢 ACTIF'} · "
@@ -80,6 +83,13 @@ class App:
                 return ("Publication automatique : ON ✅\nChaque clip bien noté par l'IA part "
                         "seul vers tes plateformes. /auto pour couper.")
             return "Publication automatique : OFF — chaque clip attend ton ✅. /auto pour activer."
+
+        async def relance(_):
+            n = self.pipeline.waiting_count()
+            self.pipeline.tiktok_full_until = 0
+            self.pipeline._publish_wake.set()
+            return (f"🚀 J'envoie les {n} clips en file vers TikTok." if n
+                    else "Aucun clip en file d'attente.")
 
         async def pause(_):
             store.set("paused", True)
@@ -155,7 +165,7 @@ class App:
                     f"?k={self.s.publish.telegram_pair_code}")
 
         tg.commands.update({"status": status, "auto": auto, "pause": pause, "resume": resume,
-                            "add": add, "remove": remove, "chaines": chaines, "tiktok": tiktok, "youtube": youtube})
+                            "add": add, "remove": remove, "chaines": chaines, "tiktok": tiktok, "youtube": youtube, "relance": relance})
 
     # ------------------------------------------------------ exécution
     async def run(self) -> None:

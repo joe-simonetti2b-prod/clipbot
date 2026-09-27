@@ -101,6 +101,7 @@ class TelegramBot:
                 ("add", "Suivre une chaîne"), ("remove", "Ne plus suivre"),
                 ("chaines", "Chaînes suivies"), ("tiktok", "Connecter TikTok"),
                 ("youtube", "Connecter YouTube Shorts"),
+                ("relance", "Renvoyer la file vers TikTok"),
             ]]})
         offset = self.store.get("telegram_offset", 0)
         while True:

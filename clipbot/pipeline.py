@@ -51,6 +51,9 @@ class Pipeline:
         self.final_dir.mkdir(parents=True, exist_ok=True)
         self._process_wake = asyncio.Event()
         self._last_channel: str | None = None
+        # TikTok refuse au-delà de 5 vidéos en attente dans la boîte de réception
+        self.tiktok_full_until = 0.0
+        self._full_notified = False
         self._publish_wake = asyncio.Event()
         telegram.on_approve = self.approve
         telegram.on_reject = self.reject
@@ -214,31 +217,80 @@ class Pipeline:
                     await self.tg.send_clip(cid, Path(row["final_path"]), row["caption"] or "",
                                             f"#{cid} prêt (auto) — aucune plateforme connectée")
                 continue
+            if targets == ["tiktok"] and time.time() < self.tiktok_full_until:
+                # File TikTok pleine : les clips attendent (les meilleurs d'abord)
+                await self._trim_approved()
+                self._publish_wake.clear()
+                try:
+                    await asyncio.wait_for(self._publish_wake.wait(),
+                                           min(60, self.tiktok_full_until - time.time()))
+                except asyncio.TimeoutError:
+                    pass
+                continue
             if not self.store.claim(cid, "approved", "publishing"):
                 continue
             await self._publish_everywhere(dict(row), targets)
             # Limites TikTok/YouTube : on espace les envois
             await asyncio.sleep(30)
 
+    MAX_WAITING = 8
+
+    async def _trim_approved(self) -> None:
+        """File d'attente TikTok limitée aux 8 meilleurs clips ; les autres reviennent
+        dans Telegram (boutons ✅/❌) pour une publication à la main."""
+        rows = self.store.db.execute(
+            "SELECT * FROM clips WHERE status='approved' "
+            "ORDER BY COALESCE(ai_score,0) DESC, score DESC").fetchall()
+        for row in rows[self.MAX_WAITING:]:
+            if self.store.claim(row["id"], "approved", "ready"):
+                mid = await self.tg.send_clip(row["id"], Path(row["final_path"]), row["caption"] or "",
+                                              f"#{row['id']} · file TikTok pleine, à publier à la main")
+                if mid:
+                    self.store.update_clip(row["id"], tg_message_id=mid)
+
+    def waiting_count(self) -> int:
+        return self.store.db.execute(
+            "SELECT COUNT(*) FROM clips WHERE status='approved'").fetchone()[0]
+
     async def _publish_everywhere(self, row: dict, targets: list[str]) -> None:
         cid, path = row["id"], Path(row["final_path"])
         caption, hook = row["caption"] or "", row["hook"] or ""
         ids, report = {}, []
+        tiktok_full = False
         for t in targets:
             try:
                 if t == "tiktok":
                     ids[t] = await self.tiktok.publish(path, caption,
                                                        branded=self.s.processing.ad_disclosure)
-                    report.append("TikTok : " + ("brouillon dans ton app, touche Publier"
+                    self._full_notified = False
+                    report.append("TikTok : " + ("prêt dans ton app → Notifications système, "
+                                                 "touche la notif puis Publier"
                                                  if self.tiktok.mode == "inbox" else "publié ✅"))
                 elif t == "youtube":
                     ids[t] = await self.youtube.publish(path, caption, hook)
                     report.append(f"YouTube Shorts ✅ youtube.com/shorts/{ids[t]}")
             except (TikTokError, YouTubeError) as e:
-                report.append(f"{t.capitalize()} ⚠️ {e}")
+                if t == "tiktok" and "too_many_pending" in str(e):
+                    tiktok_full = True
+                else:
+                    report.append(f"{t.capitalize()} ⚠️ {e}")
             except Exception as e:  # une plateforme en panne ne bloque pas les autres
                 log.exception("Publication %s échouée", t)
                 report.append(f"{t.capitalize()} ⚠️ {e}")
+        if tiktok_full and not ids:
+            # Pas une erreur : 5 vidéos attendent déjà dans TikTok. Le clip reste en file,
+            # nouvel essai toutes les 15 min (ou dès qu'un autre clip est validé).
+            self.tiktok_full_until = time.time() + 15 * 60
+            self.store.update_clip(cid, status="approved", error=None)
+            log.info("File TikTok pleine : clip %s mis en attente", cid)
+            if not self._full_notified:
+                self._full_notified = True
+                await self.tg.send(
+                    "🟡 5 vidéos attendent déjà dans TikTok (limite de TikTok).\n"
+                    "Ouvre TikTok → Messages → Notifications système → « Ton contenu de "
+                    "Joe-clipbot est prêt » → Publier (ou supprimer).\n"
+                    "Je garde les meilleurs clips en file et je les envoie dès qu'il y a de la place.")
+            return
         if ids:
             self.store.update_clip(cid, status="published", publish_id=json.dumps(ids), error=None)
             await self.tg.send(f"Clip #{cid}\n" + "\n".join(report))

@@ -55,7 +55,7 @@ class App:
         async def status(_):
             since = time.time() - 86400
             n = store.counts_since(since)
-            lives = "\n".join(f"  • {w.c.channel} ({w.c.platform.value}, "
+            lives = "\n".join(f"  • {w.c.channel} ({w.c.platform.value}, {w.chat_count} msgs de chat, "
                               f"{str(w.c.viewers) + ' viewers' if w.c.viewers else 'en live'}, "
                               f"{w.clips} clips)" for w in self.orch.watchers.values()) or "  aucun"
             tt = ("non configuré" if not self.tiktok.configured else

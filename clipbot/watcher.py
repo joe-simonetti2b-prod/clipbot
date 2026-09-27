@@ -37,6 +37,8 @@ class StreamWatcher:
         self.extractor = extractor
         self.on_clip = on_clip
         self.clips = 0
+        self.chat_count = 0
+        self._health_at, self._health_chat = time.time(), 0
         self.started_at = time.time()
         self._tasks: list[asyncio.Task] = []
 
@@ -63,7 +65,19 @@ class StreamWatcher:
 
     async def _consume_chat(self) -> None:
         async for msg in self.chat.messages():
+            self.chat_count += 1
             self.detector.add(msg)
+
+    def health(self) -> str:
+        """Bilan : débit du chat et vidéo en tampon (les deux doivent être > 0)."""
+        now = time.time()
+        mins = max((now - self._health_at) / 60, 0.1)
+        rate = (self.chat_count - self._health_chat) / mins
+        self._health_at, self._health_chat = now, self.chat_count
+        segs = len(list(self.recorder.buffer_dir.glob("seg_*.ts")))
+        return (f"{self.c.channel} ({self.c.platform.value}, {self.c.viewers} viewers) : "
+                f"chat {rate:.0f} msg/min · vidéo {segs * self.recorder.cfg.segment_s}s en tampon "
+                f"({self.recorder.mode}) · {self.clips} clips")
 
     async def _detect_loop(self) -> None:
         while True:
@@ -181,6 +195,8 @@ class Orchestrator:
                 await self.stop_all()
             return
 
+        for w in self.watchers.values():
+            log.info("♥ %s", w.health())
         live = await self.scanner.scan()
         if not live and self.watchers and self.scanner.last_scan_failed:
             return  # veille en panne : on ne coupe pas les lives en cours

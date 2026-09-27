@@ -54,6 +54,9 @@ class DiscoveryConfig:
     min_viewers: int = _env("MIN_VIEWERS", "1500", int)
     max_concurrent_streams: int = _env("MAX_CONCURRENT_STREAMS", "3", int)
     poll_interval_s: int = _env("DISCOVERY_INTERVAL_S", "300", int)
+    # Rotation : un live suivi n'est remplacé que par un live nettement plus regardé
+    switch_ratio: float = _env("SWITCH_RATIO", "1.3", float)
+    min_watch_s: int = _env("MIN_WATCH_S", "600", int)          # durée minimale de suivi
     # Chaînes autorisées. Complétable depuis Telegram (/add, /remove).
     allowed_channels: list[str] = field(default_factory=lambda: _env_list("ALLOWED_CHANNELS"))
 
@@ -80,6 +83,7 @@ class CaptureConfig:
     segment_s: int = 6              # durée d'un segment du tampon circulaire
     buffer_s: int = 300             # profondeur du tampon (5 min de live gardées)
     stream_format: str = _env("STREAM_FORMAT", "best[height<=1080]/best")
+    max_height: int = _env("CAPTURE_MAX_HEIGHT", "720", int)   # qualité max du flux Kick
     reencode: bool = False          # la découpe brute copie ; le montage 9:16 ré-encode ensuite
 
 

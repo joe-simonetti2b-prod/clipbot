@@ -27,7 +27,10 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+import aiohttp
+
 from .config import CaptureConfig, HypeConfig
+from .public import pick_variant
 from .models import HypeEvent, StreamCandidate
 
 log = logging.getLogger(__name__)
@@ -54,11 +57,54 @@ class StreamRecorder:
         self.buffer_dir = cfg.work_dir / "buffer" / _safe(candidate.key)
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
         self._procs: list[asyncio.subprocess.Process] = []
+        self.mode = "direct"
         self._stopping = False
         self.alive = asyncio.Event()
 
     # ------------------------------------------------------------ pipeline
+    # ------------------------------------------------------------ pipeline
+    async def _direct_url(self) -> str | None:
+        """URL HLS lisible directement par FFmpeg (aucun processus yt-dlp permanent :
+        ~50 Mo de RAM économisés par live suivi)."""
+        if self.c.hls_url:  # Kick : l'API fournit la playlist maîtresse
+            try:
+                async with aiohttp.ClientSession() as s, s.get(
+                        self.c.hls_url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    master = await r.text()
+                return pick_variant(master, str(r.url), self.cfg.max_height) or self.c.hls_url
+            except Exception as e:
+                log.warning("Playlist Kick illisible (%s)", e)
+                return self.c.hls_url
+        # Twitch : yt-dlp ne sert qu'à obtenir l'URL signée, puis se termine
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp", "-g", "--no-warnings", "-f", self.cfg.stream_format, self.c.url,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), 60)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return None
+        url = out.decode().strip().splitlines()
+        return url[0] if proc.returncode == 0 and url else None
+
+    def _segment_args(self) -> list[str]:
+        return ["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
+                "-f", "segment", "-segment_time", str(self.cfg.segment_s),
+                "-segment_format", "mpegts", "-reset_timestamps", "1",
+                "-strftime", "1", str(self.buffer_dir / "seg_%Y%m%d-%H%M%S.ts")]
+
     async def _spawn(self) -> None:
+        url = await self._direct_url() if self.mode == "direct" else None
+        if url:
+            ffmpeg = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
+                "-rw_timeout", "20000000", "-live_start_index", "-1",
+                "-i", url, *self._segment_args(),
+                stdin=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            self._procs = [ffmpeg, ffmpeg]
+            return
+        # Mode de secours : yt-dlp télécharge et envoie le flux à FFmpeg par un tuyau
         r_fd, w_fd = os.pipe()
         ytdlp = await asyncio.create_subprocess_exec(
             "yt-dlp", "--quiet", "--no-warnings", "--no-part",
@@ -66,12 +112,8 @@ class StreamRecorder:
             stdout=w_fd, stderr=asyncio.subprocess.PIPE,
         )
         ffmpeg = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", "pipe:0",
-            "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
-            "-f", "segment", "-segment_time", str(self.cfg.segment_s),
-            "-segment_format", "mpegts", "-reset_timestamps", "1",
-            "-strftime", "1", str(self.buffer_dir / "seg_%Y%m%d-%H%M%S.ts"),
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
+            "-i", "pipe:0", *self._segment_args(),
             stdin=r_fd, stderr=asyncio.subprocess.PIPE,
         )
         os.close(r_fd)
@@ -79,21 +121,28 @@ class StreamRecorder:
         self._procs = [ytdlp, ffmpeg]
 
     async def run(self) -> None:
-        """Boucle de supervision : relance en cas de coupure, abandonne si le live est fini."""
-        failures = 0
+        """Boucle de supervision : relance en cas de coupure, abandonne si le live est fini.
+        La capture directe qui échoue deux fois de suite bascule en mode yt-dlp."""
+        failures = direct_fails = 0
         while not self._stopping and failures < 5:
             started = time.time()
             await self._spawn()
             self.alive.set()
-            ytdlp, ffmpeg = self._procs
+            src, ffmpeg = self._procs
             await ffmpeg.wait()
             await self._kill()
             self.alive.clear()
             if self._stopping:
                 break
-            err = (await ytdlp.stderr.read()).decode(errors="ignore").strip()[-300:]
-            # Une coupure après une longue capture = token expiré ou micro-coupure.
-            failures = 0 if time.time() - started > 120 else failures + 1
+            err = (await src.stderr.read()).decode(errors="ignore").strip()[-300:]
+            short = time.time() - started < 120
+            if self.mode == "direct" and short:
+                direct_fails += 1
+                if direct_fails >= 2 and not self.c.hls_url:
+                    self.mode = "pipe"
+                    log.warning("Capture directe instable sur %s -> mode yt-dlp", self.c.key)
+            # Une coupure après une longue capture = jeton expiré ou micro-coupure.
+            failures = failures + 1 if short else 0
             log.warning("Capture %s interrompue (%s) — tentative %d/5",
                         self.c.key, err or "fin de flux", failures)
             await asyncio.sleep(min(5 * failures, 30))
@@ -115,7 +164,7 @@ class StreamRecorder:
         shutil.rmtree(self.buffer_dir, ignore_errors=True)
 
     async def _kill(self) -> None:
-        for p in self._procs:
+        for p in dict.fromkeys(self._procs):
             if p.returncode is None:
                 p.terminate()
                 try:

@@ -489,3 +489,162 @@ def test_telegram_backup_roundtrip(tmp_path):
     fresh.set("paused", True)
     asyncio.run(b2._write())
     assert bot.calls.count("sendMessage") == 1 and "editMessageText" in bot.calls
+
+
+# ------------------------------------------------------ v3 : Twitch + Kick, 2 lives
+def _cand(ch, viewers, platform=Platform.TWITCH, sid=None):
+    from clipbot.models import StreamCandidate
+    return StreamCandidate(platform, ch, sid or f"{ch}-1", f"https://x/{ch}", "", "", viewers,
+                           chat_ref=ch)
+
+
+def test_rotation_fills_then_switches_progressively():
+    from clipbot.watcher import plan_rotation
+    live = [_cand("a", 50000), _cand("b", 20000), _cand("c", 9000)]
+    stop, start = plan_rotation({}, live, 2, 1.3, 600, now=0)
+    assert stop == [] and [c.channel for c in start] == ["a", "b"]
+
+    watched = {"twitch:a-1": (live[0], 0), "twitch:b-1": (live[1], 0)}
+    # un nouveau live plus gros arrive, mais "b" n'est suivi que depuis 5 min -> on attend
+    live2 = [_cand("d", 90000)] + live
+    assert plan_rotation(watched, live2, 2, 1.3, 600, now=300) == ([], [])
+    # après 10 min : on remplace UN seul live, le moins regardé
+    stop, start = plan_rotation(watched, live2, 2, 1.3, 600, now=700)
+    assert stop == ["twitch:b-1"] and [c.channel for c in start] == ["d"]
+    # écart trop faible (< 1,3x) : pas de bascule
+    live3 = [_cand("a", 50000), _cand("b", 20000), _cand("e", 24000)]
+    assert plan_rotation(watched, live3, 2, 1.3, 600, now=5000) == ([], [])
+
+
+def test_rotation_drops_ended_and_avoids_same_creator_twice():
+    from clipbot.watcher import plan_rotation
+    a = _cand("a", 50000)
+    watched = {"twitch:a-1": (a, 0), "twitch:b-1": (_cand("b", 1000), 0)}
+    live = [a, _cand("a", 40000, Platform.KICK, "a-k"), _cand("c", 3000)]
+    stop, start = plan_rotation(watched, live, 2, 1.3, 600, now=10)
+    assert stop == ["twitch:b-1"] and [c.channel for c in start] == ["c"]
+
+
+def test_twitch_public_gql_parsing(monkeypatch):
+    from aiohttp import web
+    from clipbot import public
+
+    async def gql(req):
+        body = await req.json()
+        assert req.headers["Client-ID"] == public.TWITCH_WEB_CLIENT_ID
+        assert '"kamet0"' in body["query"]
+        return web.json_response({"data": {"users": [
+            {"login": "kamet0", "followers": {"totalCount": 5},
+             "stream": {"id": "42", "title": "KC", "viewersCount": 31000, "type": "live",
+                        "game": {"name": "Just Chatting"}}},
+            {"login": "zerator", "followers": {"totalCount": 5}, "stream": None},
+            None]}})
+
+    app = web.Application()
+    app.add_routes([web.post("/gql", gql)])
+
+    async def scenario():
+        async with TestServer(app) as srv, aiohttp.ClientSession() as session:
+            monkeypatch.setattr(public, "TWITCH_GQL", str(srv.make_url("/gql")))
+            users = await public.TwitchPublic(session).users(["Kamet0", "zerator", "nexistepas"])
+            assert users["nexistepas"] is None and users["zerator"]["stream"] is None
+            c = public.TwitchPublic.to_candidate(users["kamet0"])
+            assert (c.channel, c.viewers, c.stream_id, c.category) == ("kamet0", 31000, "42", "Just Chatting")
+    asyncio.run(scenario())
+
+
+def test_kick_channel_parsing_and_variant_choice():
+    from clipbot.public import kick_to_candidate, pick_variant
+    data = {"slug": "Westcol", "chatroom": {"id": 999},
+            "playback_url": "https://ivs.example/master.m3u8",
+            "livestream": {"id": 7, "is_live": True, "viewer_count": 45000,
+                           "session_title": "LIVE", "categories": [{"name": "Just Chatting"}]}}
+    c = kick_to_candidate(data)
+    assert (c.platform, c.channel, c.viewers, c.chat_ref) == (Platform.KICK, "westcol", 45000, "999")
+    assert c.hls_url.endswith("master.m3u8") and kick_to_candidate({"slug": "x", "livestream": None}) is None
+    master = ("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080\n1080p/index.m3u8\n"
+              "#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720\n720p/index.m3u8\n"
+              "#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=852x480\n480p/index.m3u8\n")
+    assert pick_variant(master, "https://ivs.example/master.m3u8") == "https://ivs.example/720p/index.m3u8"
+
+
+def test_kick_chat_event_parsing():
+    import json as _j
+    from clipbot.chat import parse_kick_event
+    raw = _j.dumps({"event": "App\\Events\\ChatMessageEvent", "channel": "chatrooms.9.v2",
+                    "data": _j.dumps({"id": "m1", "content": "LMAO [emote:37226:KEKW] [emote:1:KEKW]",
+                                      "sender": {"username": "Bob"}})})
+    event, msg, mid = parse_kick_event(raw)
+    assert msg.text == "LMAO KEKW KEKW" and msg.author == "Bob" and mid == "m1"
+    assert parse_kick_event('{"event":"pusher:ping","data":{}}')[1] is None
+
+
+def test_channel_resolution_both_platforms_and_missing():
+    from clipbot.public import resolve
+
+    class FakeTwitch:
+        async def users(self, logins):
+            return {l: ({"login": l} if l in ("kamet0", "amouranth") else None) for l in logins}
+
+    class FakeKick:
+        async def channel(self, slug):
+            return {"slug": slug} if slug in ("westcol", "amouranth") else None
+
+    specs = [(None, "kamet0"), (None, "westcol"), (None, "amouranth"), (None, "adadinross"),
+             ("kick", "kamet0")]
+    r = asyncio.run(resolve(specs, FakeTwitch(), FakeKick()))
+    assert (Platform.TWITCH, "kamet0") in r.targets and (Platform.KICK, "westcol") in r.targets
+    assert (Platform.TWITCH, "amouranth") in r.targets and (Platform.KICK, "amouranth") in r.targets
+    assert r.missing == ["adadinross", "kamet0"]     # kamet0 n'existe pas sur Kick (forcé)
+    assert "Introuvables" in r.summary()
+
+
+def test_backlog_keeps_best_clip_of_each_creator(tmp_path):
+    s = Settings()
+    s.capture.work_dir = tmp_path
+    s.processing.max_backlog = 2
+    store = Store(tmp_path / "k.db")
+    for ch, score in (("a", 20), ("a", 18), ("a", 15), ("b", 5)):
+        store.add_clip(platform="twitch", channel=ch, reason="rire", score=score)
+    p = pipeline_mod.Pipeline(s, store, None, FakeTelegram(), TikTokClient("", "", "inbox", "", store, None))
+    p.trim_backlog()
+    kept = sorted((r["channel"], r["score"]) for r in
+                  store.db.execute("SELECT channel, score FROM clips WHERE status='extracted'"))
+    assert kept == [("a", 20.0), ("b", 5.0)]
+    # alternance : après un clip de "a", le suivant vient de "b"
+    assert store.next_clip("extracted", avoid_channel="a")["channel"] == "b"
+
+
+def test_direct_hls_capture_without_ytdlp(tmp_path):
+    """Capture Kick : FFmpeg lit directement le flux HLS (aucun processus yt-dlp)."""
+    from aiohttp import web
+    from clipbot.config import CaptureConfig
+    from clipbot.models import StreamCandidate
+    from clipbot.recorder import StreamRecorder
+    hls = tmp_path / "hls"
+    hls.mkdir()
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
+                    "-f", "lavfi", "-i", "sine", "-t", "12", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-g", "30", "-c:a", "aac", "-f", "hls", "-hls_time", "2", "-hls_list_size", "0",
+                    str(hls / "index.m3u8")], check=True)
+    app = web.Application()
+    app.router.add_static("/", hls)
+
+    async def scenario():
+        async with TestServer(app) as srv:
+            c = StreamCandidate(Platform.KICK, "demo", "k1", "https://kick.com/demo", "", "", 1,
+                                hls_url=str(srv.make_url("/index.m3u8")))
+            rec = StreamRecorder(c, CaptureConfig(work_dir=tmp_path / "w", segment_s=2))
+            task = asyncio.create_task(rec.run())
+            segs = []
+            for _ in range(40):
+                await asyncio.sleep(0.25)
+                segs = list(rec.buffer_dir.glob("seg_*.ts"))
+                if len(segs) >= 2:
+                    break
+            rec._stopping = True
+            await rec._kill()
+            await asyncio.wait_for(task, 10)
+            return rec, segs
+    rec, segs = asyncio.run(scenario())
+    assert rec.mode == "direct" and len(segs) >= 2

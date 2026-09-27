@@ -81,9 +81,12 @@ class Store:
     def clip(self, clip_id: int) -> sqlite3.Row | None:
         return self.db.execute("SELECT * FROM clips WHERE id=?", (clip_id,)).fetchone()
 
-    def next_clip(self, status: str) -> sqlite3.Row | None:
+    def next_clip(self, status: str, avoid_channel: str | None = None) -> sqlite3.Row | None:
+        """Meilleur clip en attente ; si possible d'un autre créateur que `avoid_channel`
+        (alternance : chaque créateur suivi a ses clips)."""
         return self.db.execute(
-            "SELECT * FROM clips WHERE status=? ORDER BY score DESC, created LIMIT 1", (status,)
+            "SELECT * FROM clips WHERE status=? ORDER BY (channel IS ? ) ASC, score DESC, created "
+            "LIMIT 1", (status, avoid_channel)
         ).fetchone()
 
     def overflow(self, status: str, keep: int) -> list[sqlite3.Row]:

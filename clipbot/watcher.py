@@ -37,6 +37,7 @@ class StreamWatcher:
         self.extractor = extractor
         self.on_clip = on_clip
         self.clips = 0
+        self.started_at = time.time()
         self._tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
@@ -83,6 +84,44 @@ class StreamWatcher:
             self.on_clip(self.c, ev, raw)
 
 
+def plan_rotation(watched: dict[str, tuple[StreamCandidate, float]],
+                  live: list[StreamCandidate], limit: int, ratio: float,
+                  min_watch_s: float, now: float) -> tuple[list[str], list[StreamCandidate]]:
+    """Décide quels lives arrêter / démarrer.
+
+    watched : {clé: (candidat avec viewers à jour, heure de début de suivi)}
+    Règles :
+      * un live terminé est lâché ;
+      * les places libres vont aux lives les plus regardés ;
+      * rotation progressive : au plus UN remplacement par cycle, seulement si le
+        nouveau live a `ratio`× plus de viewers que le moins regardé des suivis,
+        et si ce dernier est suivi depuis au moins `min_watch_s` ;
+      * jamais deux fois le même créateur (Twitch + Kick en simultané).
+    """
+    live_by_key = {c.key: c for c in live}
+    stop = [k for k in watched if k not in live_by_key]
+    kept = {k: (live_by_key[k], t) for k, (_, t) in watched.items() if k in live_by_key}
+    creators = {c.channel.lower() for c, _ in kept.values()}
+    pool = [c for c in live if c.key not in kept and c.channel.lower() not in creators]
+    start: list[StreamCandidate] = []
+    for c in pool:
+        if len(kept) + len(start) >= limit:
+            break
+        if c.channel.lower() in {x.channel.lower() for x in start}:
+            continue
+        start.append(c)
+    if len(kept) + len(start) >= limit and kept:
+        rest = [c for c in pool if c not in start
+                and c.channel.lower() not in {x.channel.lower() for x in start}]
+        if rest:
+            best = rest[0]
+            weakest_key, (weakest, since) = min(kept.items(), key=lambda kv: kv[1][0].viewers)
+            if now - since >= min_watch_s and best.viewers >= max(1, weakest.viewers) * ratio:
+                stop.append(weakest_key)
+                start.append(best)
+    return stop, start
+
+
 class Orchestrator:
     def __init__(self, settings: Settings, store: Store, session: aiohttp.ClientSession,
                  on_clip: OnClip):
@@ -92,7 +131,9 @@ class Orchestrator:
         self.on_clip = on_clip
         self.watchers: dict[str, StreamWatcher] = {}
         self.scanner = TrendScanner(settings.discovery, session,
-                                    extra_channels=lambda: store.get("extra_channels", []))
+                                    extra_channels=lambda: store.get("extra_channels", []),
+                                    on_resolved=lambda r: self.notify(r.summary()))
+        self.notify = lambda text: None   # branché par l'application (message Telegram)
         self.extractor = ClipExtractor(settings.capture, settings.hype)
         self._rescan = asyncio.Event()
 
@@ -106,7 +147,7 @@ class Orchestrator:
     def kick_message(self, broadcaster_user_id: str, author: str, text: str) -> None:
         """Appelé par le webhook Kick : route le message vers le bon live."""
         for w in self.watchers.values():
-            if w.c.platform is Platform.KICK and w.c.chat_ref == broadcaster_user_id \
+            if w.c.platform is Platform.KICK and w.c.chat_ref == f"webhook:{broadcaster_user_id}" \
                     and isinstance(w.chat, QueueChatReader):
                 try:
                     w.chat.queue.put_nowait(ChatMessage(time.time(), author, text))
@@ -140,28 +181,26 @@ class Orchestrator:
                 await self.stop_all()
             return
 
-        limit = self.s.discovery.max_concurrent_streams
-        # Économie de CPU : quand toutes les places sont prises, on ne sonde que les
-        # chaînes prioritaires (placées avant celles suivies dans la liste).
-        probe_until = None
-        if len(self.watchers) >= limit:
-            order = [name for _, name in self.scanner.targets()]
-            ranks = [order.index(w.c.channel.lower()) for w in self.watchers.values()
-                     if w.c.channel.lower() in order]
-            if ranks:
-                probe_until = max(ranks)
-        top = (await self.scanner.scan(probe_until=probe_until))[:limit]
-        wanted = {c.key: c for c in top}
-
-        # Lâcher les lives sortis du top (hystérésis : on garde s'il reste une place)
-        for key in list(self.watchers):
-            if key not in wanted and len(wanted) >= limit:
-                await self.watchers.pop(key).stop()
-
-        for key, c in wanted.items():
-            if key not in self.watchers and len(self.watchers) < limit:
-                w = StreamWatcher(c, self.s, self.session, self.extractor, self.on_clip)
-                self.watchers[key] = w
-                if c.platform is Platform.KICK and self.scanner.kick.enabled():
-                    await self.scanner.kick.subscribe_chat(c.chat_ref)
-                await w.start()
+        live = await self.scanner.scan()
+        if not live and self.watchers and self.scanner.last_scan_failed:
+            return  # veille en panne : on ne coupe pas les lives en cours
+        watched = {k: (w.c, w.started_at) for k, w in self.watchers.items()}
+        d = self.s.discovery
+        stop, start = plan_rotation(watched, live, d.max_concurrent_streams,
+                                    d.switch_ratio, d.min_watch_s, time.time())
+        live_by_key = {c.key: c for c in live}
+        for k, w in self.watchers.items():
+            if k in live_by_key:
+                w.c.viewers = live_by_key[k].viewers   # affichage /status à jour
+        for key in stop:
+            w = self.watchers.pop(key, None)
+            if w:
+                log.info("↔ Arrêt du suivi %s (%s)", w.c.channel,
+                         "live terminé" if key not in live_by_key else "remplacé, moins de viewers")
+                await w.stop()
+        for c in start:
+            w = StreamWatcher(c, self.s, self.session, self.extractor, self.on_clip)
+            self.watchers[c.key] = w
+            if c.platform is Platform.KICK and self.scanner.kick.enabled():
+                await self.scanner.kick.subscribe_chat(c.chat_ref)
+            await w.start()

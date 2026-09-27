@@ -22,6 +22,7 @@ import aiohttp
 
 from .config import DiscoveryConfig
 from .models import Platform, StreamCandidate
+from .public import KickPublic, Resolution, TwitchPublic, kick_to_candidate, resolve
 
 log = logging.getLogger(__name__)
 
@@ -227,7 +228,7 @@ class KickDiscovery(DiscoverySource):
                         category=(s.get("category") or {}).get("name", ""),
                         viewers=int(s.get("viewer_count", 0)),
                         language=s.get("language", ""),
-                        chat_ref=str(s["broadcaster_user_id"]),
+                        chat_ref=f"webhook:{s['broadcaster_user_id']}",
                     )
                 )
         return out
@@ -235,6 +236,7 @@ class KickDiscovery(DiscoverySource):
 
     async def subscribe_chat(self, broadcaster_user_id: str) -> None:
         """Demande à Kick d'envoyer le chat de cette chaîne sur notre webhook."""
+        broadcaster_user_id = broadcaster_user_id.removeprefix("webhook:")
         token = await self.tokens.get(self.session)
         body = {"broadcaster_user_id": int(broadcaster_user_id), "method": "webhook",
                 "events": [{"name": "chat.message.sent", "version": 1}]}
@@ -300,58 +302,128 @@ def parse_channel(spec: str) -> tuple[Platform, str]:
 # --------------------------------------------------------------------------- #
 # Agrégateur
 # --------------------------------------------------------------------------- #
+def parse_spec(spec: str) -> tuple[str | None, str]:
+    """ « kamet0 » -> (None, kamet0) : cherché sur Twitch ET Kick ;
+    « kick:xxx », « twitch:xxx » ou une URL forcent la plateforme. """
+    spec = spec.strip().lower().rstrip("/")
+    for p in ("twitch", "kick", "youtube"):
+        if spec.startswith(p + ":"):
+            return p, spec.split(":", 1)[1].lstrip("@")
+    if "kick.com/" in spec:
+        return "kick", spec.rsplit("/", 1)[1]
+    if "twitch.tv/" in spec:
+        return "twitch", spec.rsplit("/", 1)[1]
+    return None, spec.lstrip("@")
+
+
 class TrendScanner:
+    RESOLVE_EVERY_S = 6 * 3600
+
     def __init__(self, cfg: DiscoveryConfig, session: aiohttp.ClientSession,
-                 extra_channels: Callable[[], list[str]] = lambda: []):
+                 extra_channels: Callable[[], list[str]] = lambda: [],
+                 on_resolved: Callable[[Resolution], None] | None = None):
         self.cfg = cfg
         self.extra_channels = extra_channels
+        self.on_resolved = on_resolved
         self.twitch = TwitchDiscovery(cfg, session)
         self.youtube = YouTubeDiscovery(cfg, session)
         self.kick = KickDiscovery(cfg, session)
         self.prober = ProbeDiscovery()
+        self.tw_public = TwitchPublic(session)
+        self.kick_public = KickPublic()
+        self.resolution: Resolution | None = None
+        self._resolved_for: tuple = ()
+        self.last_scan_failed = False
+
+    def specs(self) -> list[tuple[str | None, str]]:
+        raw = self.cfg.allowed_channels + self.extra_channels()
+        return list(dict.fromkeys(parse_spec(s) for s in raw if s.strip()))
+
+    async def ensure_resolved(self) -> None:
+        specs = tuple(self.specs())
+        fresh = self.resolution and time.time() - self.resolution.at < self.RESOLVE_EVERY_S
+        if specs == self._resolved_for and fresh:
+            return
+        self.resolution = await resolve(list(specs), self.tw_public, self.kick_public)
+        self._resolved_for = specs
+        log.info("%s", self.resolution.summary().replace("\n", " | "))
+        if self.on_resolved:
+            self.on_resolved(self.resolution)
 
     def targets(self) -> list[tuple[Platform, str]]:
-        specs = self.cfg.allowed_channels + self.extra_channels()
-        return list(dict.fromkeys(parse_channel(s) for s in specs))  # sans doublons, ordre gardé
+        if self.resolution:
+            return self.resolution.targets
+        out = []
+        for forced, name in self.specs():
+            out.append((Platform(forced) if forced else Platform.TWITCH, name))
+        return out
+
+    async def _twitch_live(self, names: list[str], probe_until: int | None) -> list[StreamCandidate]:
+        if self.twitch.enabled():
+            self.twitch.targets = names
+            return await self.twitch.fetch()
+        try:
+            users = await self.tw_public.users(names)
+            return [c for u in users.values() if u and (c := TwitchPublic.to_candidate(u))]
+        except Exception as e:
+            # Secours : sonde yt-dlp (plus lente, sans nombre de viewers)
+            log.warning("Twitch public indisponible (%s) -> sonde yt-dlp", e)
+            limit = probe_until if probe_until is not None else 8
+            res = await asyncio.gather(*(self.prober.probe(n) for n in names[:limit]),
+                                       return_exceptions=True)
+            return [r for r in res if isinstance(r, StreamCandidate)]
+
+    async def _kick_live(self, names: list[str]) -> list[StreamCandidate]:
+        if self.kick.enabled():
+            self.kick.targets = names
+            return await self.kick.fetch()
+
+        async def one(slug):
+            try:
+                data = await self.kick_public.channel(slug)
+                return kick_to_candidate(data) if data else None
+            except Exception as e:
+                log.debug("Kick %s : %s", slug, e)
+                return None
+        res = await asyncio.gather(*(one(n) for n in names))
+        return [c for c in res if c]
 
     async def scan(self, probe_until: int | None = None) -> list[StreamCandidate]:
-        """Interroge toutes les sources en parallèle, tolère la panne de l'une d'elles.
-        probe_until : ne sonder (sans clé API) que les chaînes de rang < probe_until."""
+        """Lives en cours, triés par viewers. Tolère la panne d'une source."""
+        if not self.specs():
+            return await self._scan_trends()
+        await self.ensure_resolved()
         targets = self.targets()
-        by_platform = {p: [n for q, n in targets if q is p] for p in Platform}
+        tw = [n for p, n in targets if p is Platform.TWITCH]
+        kk = [n for p, n in targets if p is Platform.KICK]
         jobs = []
-        for src in (self.twitch, self.youtube, self.kick):
-            if not src.enabled():
-                continue
-            if targets and not by_platform[src.platform]:
-                continue  # liste blanche sans chaîne sur cette plateforme
-            src.targets = by_platform[src.platform]
-            jobs.append(src.fetch())
-        # Twitch sans clé API : sonde yt-dlp sur les chaînes listées
-        if not self.twitch.enabled():
-            to_probe = [n for i, (p, n) in enumerate(targets) if p is Platform.TWITCH
-                        and (probe_until is None or i < probe_until)]
-            jobs += [self.prober.probe(n) for n in to_probe]
-        if not jobs:
-            if probe_until is None:
-                log.warning("Rien à surveiller : ajoute une chaîne (/add) ou des clés API.")
-            return []
-
+        if tw:
+            jobs.append(self._twitch_live(tw, probe_until))
+        if kk:
+            jobs.append(self._kick_live(kk))
         results = await asyncio.gather(*jobs, return_exceptions=True)
-        candidates: list[StreamCandidate] = []
-        for res in results:
-            if isinstance(res, Exception):
-                log.error("Veille en échec : %s", res)
-            elif isinstance(res, list):
-                candidates += res
-            elif res is not None:
-                candidates.append(res)
+        live: list[StreamCandidate] = []
+        self.last_scan_failed = all(isinstance(r, Exception) for r in results)
+        for r in results:
+            if isinstance(r, Exception):
+                log.error("Veille en échec : %s", r)
+            else:
+                live += r
+        wanted = set(targets)
+        live = [c for c in live if (c.platform, c.channel.lower()) in wanted]
+        live.sort(key=lambda c: c.viewers, reverse=True)
+        top = ", ".join(f"{c.channel}({c.platform.value[0]}) {c.viewers}" for c in live[:5])
+        log.info("Veille : %d lives en cours%s", len(live), f" — {top}" if top else "")
+        return live
 
-        if targets:
-            wanted = {(p, n) for p, n in targets}
-            filtered = [c for c in candidates if (c.platform, c.channel.lower()) in wanted]
-        else:
-            filtered = [c for c in candidates if c.viewers >= self.cfg.min_viewers]
+    async def _scan_trends(self) -> list[StreamCandidate]:
+        """Sans liste de chaînes : tendances via les API officielles (clés requises)."""
+        jobs = [src.fetch() for src in (self.twitch, self.youtube, self.kick) if src.enabled()]
+        if not jobs:
+            log.warning("Rien à surveiller : ajoute une chaîne (/add) ou des clés API.")
+            return []
+        results = await asyncio.gather(*jobs, return_exceptions=True)
+        candidates = [c for r in results if not isinstance(r, Exception) for c in r]
+        filtered = [c for c in candidates if c.viewers >= self.cfg.min_viewers]
         filtered.sort(key=lambda c: c.viewers, reverse=True)
-        log.info("Veille : %d lives retenus sur %d", len(filtered), len(candidates))
         return filtered

@@ -1,5 +1,6 @@
 aiohttp>=3.9,<4
 yt-dlp>=2025.1.1
 faster-whisper>=1.1
+curl_cffi>=0.7  # API Kick (protégée par Cloudflare)
 opencv-python-headless>=4.9,<5  # OpenCV 5 a retiré les cascades de Haar
 # Binaire requis : ffmpeg (installé par le Dockerfile)

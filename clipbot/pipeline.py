@@ -50,6 +50,7 @@ class Pipeline:
         self.final_dir = settings.capture.work_dir / "final"
         self.final_dir.mkdir(parents=True, exist_ok=True)
         self._process_wake = asyncio.Event()
+        self._last_channel: str | None = None
         self._publish_wake = asyncio.Event()
         telegram.on_approve = self.approve
         telegram.on_reject = self.reject
@@ -62,7 +63,21 @@ class Pipeline:
     def trim_backlog(self) -> None:
         """La machine gratuite monte ~1 clip toutes les 5-10 min : si les pics arrivent
         plus vite, on ne garde en attente que les meilleurs."""
-        for row in self.store.overflow("extracted", self.s.processing.max_backlog):
+        rows = self.store.db.execute(
+            "SELECT * FROM clips WHERE status='extracted' ORDER BY score DESC, created DESC"
+        ).fetchall()
+        # Le meilleur clip de chaque créateur est toujours gardé, puis les meilleurs scores
+        keep, seen = [], set()
+        for r in rows:
+            if r["channel"] not in seen:
+                keep.append(r["id"])
+                seen.add(r["channel"])
+        for r in rows:
+            if len(keep) >= max(self.s.processing.max_backlog, len(seen)):
+                break
+            if r["id"] not in keep:
+                keep.append(r["id"])
+        for row in (r for r in rows if r["id"] not in keep):
             if self.store.claim(row["id"], "extracted", "skipped"):
                 if row["raw_path"]:
                     Path(row["raw_path"]).unlink(missing_ok=True)
@@ -99,7 +114,7 @@ class Pipeline:
     # ------------------------------------------------------- post-production
     async def run_processor(self) -> None:
         while True:
-            row = self.store.next_clip("extracted")
+            row = self.store.next_clip("extracted", avoid_channel=self._last_channel)
             if row is None:
                 self._process_wake.clear()
                 try:
@@ -109,6 +124,7 @@ class Pipeline:
                 continue
             if not self.store.claim(row["id"], "extracted", "processing"):
                 continue
+            self._last_channel = row["channel"]
             try:
                 await self._process(dict(row))
             except asyncio.CancelledError:

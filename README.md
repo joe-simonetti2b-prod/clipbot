@@ -63,6 +63,17 @@ Le bot se réveille lui-même toutes les 10 min pour que Render ne l'endorme pas
 Ouvre ton bot Telegram → `/start <ton code>` → `/status`.
 Chaque clip arrive ensuite avec ✅ Publier / ❌ Jeter.
 
+## Chaînes Twitch et Kick
+
+`ALLOWED_CHANNELS` (ou `/add`) accepte un simple pseudo : le bot le cherche sur **Twitch
+et Kick**, le garde partout où il existe, et t'envoie sur Telegram la liste des pseudos
+introuvables. `kick:pseudo` ou `twitch:pseudo` forcent une plateforme.
+
+Toutes les 5 minutes, le bot compare le nombre de viewers de toutes les chaînes en live
+et suit les **2 plus regardées**. La rotation est progressive : un live suivi n'est
+remplacé que par un live 1,3× plus regardé, après au moins 10 minutes de suivi, et un
+seul changement par cycle. La file de montage alterne entre les créateurs.
+
 ## Commandes Telegram
 
 | Commande | Effet |

@@ -25,7 +25,7 @@ services:
         sync: false
       # --- réglages du profil léger ---
       - key: MAX_CONCURRENT_STREAMS
-        value: "1"
+        value: "2"               # capture directe FFmpeg : ~25 Mo par live suivi
       - key: STREAM_FORMAT
         value: "best[height<=720]/best"
       - key: OUTPUT_HEIGHT

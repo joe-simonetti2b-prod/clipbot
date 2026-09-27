@@ -18,7 +18,7 @@ import aiohttp
 from aiohttp import web
 
 from .config import Settings
-from .discovery import parse_channel
+from .discovery import parse_spec
 from .models import HypeEvent, StreamCandidate
 from .pipeline import Pipeline
 from .recorder import RawClip
@@ -93,31 +93,45 @@ class App:
 
         async def add(args):
             if not args:
-                return "Usage : /add <chaîne>  (ex : /add kamet0 ou /add kick:xxx)"
-            p, name = parse_channel(args[0])
+                return ("Usage : /add <pseudo>  — cherché sur Twitch ET Kick\n"
+                        "Forcer une plateforme : /add kick:pseudo ou /add twitch:pseudo")
+            added = []
             chans = store.get("extra_channels", [])
-            spec = f"{p.value}:{name}"
-            if spec not in chans:
-                chans.append(spec)
-                store.set("extra_channels", chans)
+            for a in args:
+                forced, name = parse_spec(a)
+                spec = f"{forced}:{name}" if forced else name
+                if spec not in chans:
+                    chans.append(spec)
+                    added.append(spec)
+            store.set("extra_channels", chans)
             self.orch.rescan()
-            return f"➕ {spec} ajoutée. Surveillée dès qu'elle est en live."
+            return (f"➕ Ajouté : {', '.join(added) or 'rien de nouveau'}.\n"
+                    "Je vérifie que le pseudo existe et je te dis où je l'ai trouvé.")
 
         async def remove(args):
             if not args:
-                return "Usage : /remove <chaîne>"
-            p, name = parse_channel(args[0])
-            spec = f"{p.value}:{name}"
-            store.set("extra_channels", [c for c in store.get("extra_channels", []) if c != spec])
+                return "Usage : /remove <pseudo>"
+            names = {parse_spec(a)[1] for a in args}
+            store.set("extra_channels", [c for c in store.get("extra_channels", [])
+                                         if parse_spec(c)[1] not in names])
+            env = [n for n in self.s.discovery.allowed_channels if parse_spec(n)[1] in names]
             self.orch.rescan()
-            return f"➖ {spec} retirée."
+            msg = f"➖ Retiré : {', '.join(sorted(names))}."
+            if env:
+                msg += ("\n(Certaines viennent de ALLOWED_CHANNELS dans Render : "
+                        "dis-le moi pour que je les retire définitivement.)")
+            return msg
 
         async def chaines(_):
-            env = self.s.discovery.allowed_channels
-            extra = store.get("extra_channels", [])
-            if not env and not extra:
-                return "Aucune liste : veille par tendances (catégories / langue)."
-            return "Chaînes suivies :\n" + "\n".join(f"  • {c}" for c in env + extra)
+            r = self.orch.scanner.resolution
+            if r is None:
+                if not self.orch.scanner.specs():
+                    return "Aucune liste : veille par tendances (catégories / langue)."
+                return "Vérification des pseudos en cours…"
+            watched = ", ".join(f"{w.c.channel} ({w.c.platform.value}, {w.c.viewers} viewers)"
+                                for w in self.orch.watchers.values()) or "aucun"
+            return (f"{r.summary()}\n\nTwitch : {', '.join(r.twitch) or '—'}\n"
+                    f"Kick : {', '.join(r.kick) or '—'}\n\nEn cours de suivi : {watched}")
 
         async def youtube(_):
             if not self.youtube.configured:
@@ -167,6 +181,7 @@ class App:
                                          self.store, session)
             self.pipeline = Pipeline(self.s, self.store, session, self.tg, self.tiktok, self.youtube)
             self.orch = Orchestrator(self.s, self.store, session, self._on_clip)
+            self.orch.notify = lambda text: asyncio.create_task(self.tg.send("🔎 " + text))
             self._register_commands()
 
             runner = web.AppRunner(build_app(self))

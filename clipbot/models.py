@@ -23,6 +23,7 @@ class StreamCandidate:
     viewers: int
     language: str = ""
     chat_ref: str = ""           # canal IRC / liveChatId YouTube / chatroom Kick
+    hls_url: str = ""            # flux vidéo direct (Kick) : lu par FFmpeg sans yt-dlp
 
     @property
     def key(self) -> str:

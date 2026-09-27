@@ -689,6 +689,7 @@ def test_frozen_capture_is_restarted_in_ytdlp_mode(tmp_path):
 
     class Frozen(StreamRecorder):
         STALL_S = 1.5
+        STARTUP_GRACE_S = 1.5
         WATCH_EVERY_S = 0.3
         spawns = []
 
@@ -701,13 +702,14 @@ def test_frozen_capture_is_restarted_in_ytdlp_mode(tmp_path):
         c = StreamCandidate(Platform.TWITCH, "nico_la", "1", "https://www.twitch.tv/nico_la", "", "", 1)
         rec = Frozen(c, CaptureConfig(work_dir=tmp_path, segment_s=2))
         task = asyncio.create_task(rec.run())
-        await asyncio.sleep(4.5)
+        await asyncio.sleep(9)
         rec._stopping = True
         await rec._kill()
         await asyncio.wait_for(task, 10)
         return rec
     rec = asyncio.run(scenario())
-    assert rec.mode == "pipe" and Frozen.spawns[0] == "streamlink"   # figée -> bascule yt-dlp
+    # figée deux fois -> bascule yt-dlp (1re fois : seconde chance, pub mal annoncée)
+    assert rec.mode == "pipe" and Frozen.spawns[:2] == ["streamlink", "streamlink"]
 
 
 def test_noisy_capture_process_does_not_block(tmp_path):
@@ -768,3 +770,21 @@ def test_tiktok_pending_limit_keeps_clip_queued(tmp_path):
     assert all(store.clip(c)["status"] == "approved" for c in ids)   # en file, pas perdus
     assert p.tiktok_full_until > 0 and len(tg.messages) == 1 and not tg.clips
     assert store.next_clip("approved")["ai_score"] == 8              # le meilleur passe d'abord
+
+
+def test_streamlink_ad_break_not_a_stall(tmp_path):
+    import time as _t
+    from clipbot.config import CaptureConfig
+    from clipbot.models import Platform, StreamCandidate
+    from clipbot.recorder import StreamRecorder
+    c = StreamCandidate(platform=Platform.TWITCH, channel="x", stream_id="1",
+                        url="https://www.twitch.tv/x", title="", category="", viewers=1)
+    r = StreamRecorder(c, CaptureConfig(work_dir=tmp_path))
+    assert r.mode == "streamlink"
+    now = _t.time()
+    # Démarrage : 60 s sans morceau = pub d'avant-live tolérée
+    assert not r._is_stalled(now - 60)
+    assert r._is_stalled(now - 200)
+    # Pub annoncée par Streamlink : tolérée pendant sa durée
+    r._note_ad("[plugins.twitch][info] Detected advertisement break of 90 seconds")
+    assert not r._is_stalled(now - 200)

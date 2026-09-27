@@ -63,6 +63,7 @@ class StreamRecorder:
                      "streamlink" if candidate.platform is Platform.TWITCH else "pipe")
         self._err_tail: deque[str] = deque(maxlen=6)
         self._drains: list[asyncio.Future] = []
+        self._ad_until = 0.0      # pub Twitch en cours (Streamlink la retire : aucun flux)
         self._stopping = False
         self.alive = asyncio.Event()
 
@@ -116,7 +117,7 @@ class StreamRecorder:
             h = self.cfg.max_height
             quality = f"{h}p60,{h}p,480p,best"
             ytdlp = await asyncio.create_subprocess_exec(
-                "streamlink", "--stdout", "--loglevel", "warning",
+                "streamlink", "--stdout", "--loglevel", "info",
                 "--stream-segment-threads", "1", self.c.url, quality,
                 stdout=w_fd, stderr=asyncio.subprocess.PIPE,
             )
@@ -146,12 +147,38 @@ class StreamRecorder:
         async def pump():
             try:
                 while line := await proc.stderr.readline():
-                    self._err_tail.append(f"{name}: {line.decode(errors='ignore').strip()}")
+                    text = line.decode(errors='ignore').strip()
+                    self._note_ad(text)
+                    if "[info]" in text and "advertisement" not in text:
+                        continue   # messages d'info ordinaires : inutiles dans les erreurs
+                    self._err_tail.append(f"{name}: {text}")
             except Exception:
                 pass
         if proc.stderr:
             self._drains.append(asyncio.ensure_future(pump()))
     WATCH_EVERY_S = 10.0
+    STARTUP_GRACE_S = 120   # pub d'avant-live (pre-roll) : rien n'arrive pendant 15-90 s
+    AD_RE = re.compile(r"advertisement break of (\d+(?:\.\d+)?) second", re.I)
+
+    def _note_ad(self, text: str) -> None:
+        """Streamlink annonce les coupures pub qu'il retire : pendant ce temps aucun
+        morceau n'est écrit, ce n'est pas une capture figée."""
+        m = self.AD_RE.search(text)
+        if m:
+            self._ad_until = max(self._ad_until, time.time() + float(m.group(1)) + 20)
+        elif "pre-roll" in text.lower():
+            self._ad_until = max(self._ad_until, time.time() + 90)
+
+    def _is_stalled(self, started: float) -> bool:
+        if time.time() < self._ad_until:
+            return False
+        age = self._last_write_age(started)
+        has_seg = any(True for _ in self.buffer_dir.glob("seg_*.ts"))
+        limit = self.STALL_S
+        if self.mode == "streamlink" and time.time() - started < self.STARTUP_GRACE_S + 5:
+            if not has_seg or age >= time.time() - started - 1:
+                limit = self.STARTUP_GRACE_S
+        return age > limit
 
     def _last_write_age(self, started: float) -> float:
         """Âge du dernier morceau CRÉÉ. Un morceau naît toutes les ~6 s ; si le
@@ -167,6 +194,7 @@ class StreamRecorder:
         failures = direct_fails = 0
         while not self._stopping and failures < 5:
             started = time.time()
+            self._ad_until = 0.0
             await self._spawn()
             self.alive.set()
             src, ffmpeg = self._procs
@@ -174,7 +202,7 @@ class StreamRecorder:
             stalled = False
             while not waiter.done():
                 await asyncio.wait({waiter}, timeout=self.WATCH_EVERY_S)
-                if not waiter.done() and self._last_write_age(started) > self.STALL_S:
+                if not waiter.done() and self._is_stalled(started):
                     # FFmpeg tourne mais n'écrit plus rien (ex. pub Twitch mal gérée)
                     stalled = True
                     break
@@ -190,9 +218,13 @@ class StreamRecorder:
             err = " | ".join(self._err_tail)[-400:]
             self._err_tail.clear()
             short = time.time() - started < 120
+            if time.time() - started > 600:
+                direct_fails = 0          # longue capture réussie : compteur remis à zéro
             if self.mode in ("direct", "streamlink") and (stalled or short):
                 direct_fails += 1
-                if (stalled or direct_fails >= 2) and not self.c.hls_url:
+                # Streamlink : on lui laisse une 2e chance (pub mal annoncée) avant yt-dlp
+                limit = 2 if self.mode == "streamlink" else 1
+                if ((stalled and direct_fails >= limit) or direct_fails >= 2) and not self.c.hls_url:
                     log.warning("Capture %s %s sur %s -> mode yt-dlp", self.mode,
                                 "figée" if stalled else "instable", self.c.key)
                     self.mode = "pipe"

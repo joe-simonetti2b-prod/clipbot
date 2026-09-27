@@ -153,6 +153,7 @@ class Resolution:
     twitch: list[str] = field(default_factory=list)
     kick: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
+    homonyms: list[str] = field(default_factory=list)    # comptes homonymes écartés
     unchecked: list[str] = field(default_factory=list)   # vérification impossible (réseau)
     at: float = field(default_factory=time.time)
 
@@ -162,11 +163,25 @@ class Resolution:
         text = "Chaînes vérifiées : " + " · ".join(parts)
         if both:
             text += f"\nSur les deux plateformes : {', '.join(both)}"
+        if self.homonyms:
+            text += f"\nHomonymes écartés (compte quasi vide) : {', '.join(self.homonyms)}"
         if self.missing:
             text += f"\n⚠️ Introuvables (ignorées) : {', '.join(self.missing)}"
         if self.unchecked:
             text += f"\n❔ Non vérifiées (réseau) : {', '.join(self.unchecked)}"
         return text
+
+
+def twitch_followers(u: dict) -> int | None:
+    f = (u or {}).get("followers") or {}
+    return int(f["totalCount"]) if isinstance(f, dict) and "totalCount" in f else None
+
+
+def kick_followers(d: dict) -> int | None:
+    for k in ("followers_count", "followersCount"):
+        if isinstance(d, dict) and d.get(k) is not None:
+            return int(d[k])
+    return None
 
 
 async def resolve(specs: list[tuple[str | None, str]], twitch: TwitchPublic,
@@ -198,6 +213,21 @@ async def resolve(specs: list[tuple[str | None, str]], twitch: TwitchPublic,
         on_tw = forced in (None, "twitch") and tw_ok and tw_found.get(name) is not None
         kd, k_ok = kk.get(name, (None, True))
         on_kk = forced in (None, "kick") and kd is not None
+        if forced is None and on_tw and on_kk:
+            # Même pseudo sur les deux plateformes : souvent un homonyme sans rapport.
+            # On garde le compte principal (le plus suivi) ; l'autre seulement s'il est
+            # lui aussi conséquent (≥ 100 000 abonnés ou ≥ 20 % du principal).
+            tf = twitch_followers(tw_found[name])
+            kf = kick_followers(kd)
+            if tf is not None and kf is not None:
+                top = max(tf, kf)
+                keep = lambda f: f == top or f >= 100_000 or f >= 0.2 * top
+                if not keep(tf):
+                    on_tw = False
+                    res.homonyms.append(f"{name} (Twitch, {tf} abonnés)")
+                if not keep(kf):
+                    on_kk = False
+                    res.homonyms.append(f"{name} (Kick, {kf} abonnés)")
         if on_tw:
             res.twitch.append(name)
             res.targets.append((Platform.TWITCH, name))

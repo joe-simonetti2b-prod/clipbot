@@ -648,3 +648,24 @@ def test_direct_hls_capture_without_ytdlp(tmp_path):
             return rec, segs
     rec, segs = asyncio.run(scenario())
     assert rec.mode == "direct" and len(segs) >= 2
+
+
+def test_resolution_drops_homonym_accounts():
+    from clipbot.public import resolve
+
+    class T:
+        async def users(self, logins):
+            data = {"squeezie": 9_000_000, "westcol": 400_000, "xqc": 12_000_000}
+            return {l: ({"login": l, "followers": {"totalCount": data[l]}} if l in data else None)
+                    for l in logins}
+
+    class K:
+        async def channel(self, slug):
+            data = {"squeezie": 37, "westcol": 5_000_000, "xqc": 900_000}
+            return {"slug": slug, "followers_count": data[slug]} if slug in data else None
+
+    r = asyncio.run(resolve([(None, "squeezie"), (None, "westcol"), (None, "xqc")], T(), K()))
+    assert (Platform.KICK, "squeezie") not in r.targets and (Platform.TWITCH, "squeezie") in r.targets
+    assert (Platform.KICK, "westcol") in r.targets and (Platform.TWITCH, "westcol") in r.targets
+    assert (Platform.KICK, "xqc") in r.targets          # 900k abonnés : vrai compte, gardé
+    assert any("squeezie" in h for h in r.homonyms)

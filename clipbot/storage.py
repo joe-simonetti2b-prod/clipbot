@@ -54,12 +54,16 @@ class Store:
         row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         return json.loads(row["value"]) if row else default
 
+    on_set = None  # rappel optionnel (sauvegarde Telegram des réglages importants)
+
     def set(self, key: str, value: Any) -> None:
         self.db.execute(
             "INSERT INTO kv(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, json.dumps(value)),
         )
+        if self.on_set:
+            self.on_set(key)
 
     # --------------------------------------------------------------- clips
     def add_clip(self, **fields) -> int:

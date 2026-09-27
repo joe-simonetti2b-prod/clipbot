@@ -25,6 +25,7 @@ from .recorder import RawClip
 from .storage import Store
 from .telegram import TelegramBot
 from .tiktok import TikTokClient
+from .backup import TelegramBackup
 from .youtube import YouTubeClient
 from .llm import LLM
 from .watcher import Orchestrator
@@ -152,6 +153,10 @@ class App:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
             self.tg = TelegramBot(self.s.publish.telegram_token, self.s.publish.telegram_pair_code,
                                   self.store, session, self.s.publish.telegram_owner_id)
+            # Hébergeur sans disque : on restaure connexions et réglages depuis Telegram
+            self.backup = TelegramBackup(self.tg, self.store, self.s.publish.telegram_token)
+            await self.backup.restore()
+            self.store.on_set = self.backup.mark_dirty
             self.tiktok = TikTokClient(self.s.publish.tiktok_client_key,
                                        self.s.publish.tiktok_client_secret,
                                        self.s.publish.tiktok_mode, self.s.server.public_url,
@@ -176,6 +181,7 @@ class App:
                 ("janitor", self.pipeline.run_janitor()),
                 ("telegram", self.tg.run()),
                 ("keepalive", self._keepalive(session)),
+                ("backup", self.backup.run()),
             )]
             self._log_config()
             await self.tg.send("🟢 clipbot démarré. /status")

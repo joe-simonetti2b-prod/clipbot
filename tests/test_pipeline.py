@@ -450,3 +450,42 @@ def test_failed_publish_returns_clip_to_telegram(tmp_path):
     row = store.clip(cid)
     assert row["status"] == "ready" and "brouillons" in row["error"]
     assert tg.clips and tg.clips[0][0] == cid     # renvoyé avec ses boutons
+
+
+def test_telegram_backup_roundtrip(tmp_path):
+    from clipbot.backup import TelegramBackup, seal, unseal, HEADER
+    assert unseal(seal({"a": 1}, "tok"), "tok") == {"a": 1}
+    assert unseal(seal({"a": 1}, "tok"), "autre") is None       # illisible sans le bon jeton
+
+    class FakeBot:
+        enabled, owner = True, 42
+        def __init__(self):
+            self.pinned, self.calls = None, []
+        async def _call(self, method, **kw):
+            self.calls.append(method)
+            body = kw.get("json", {})
+            if method == "sendMessage":
+                self.pinned = {"message_id": 7, "text": body["text"]}
+                return {"message_id": 7}
+            if method == "editMessageText":
+                self.pinned["text"] = body["text"]
+                return {}
+            if method == "getChat":
+                return {"pinned_message": self.pinned} if self.pinned else {}
+            return {}
+
+    bot = FakeBot()
+    first = Store(tmp_path / "a.db")
+    b1 = TelegramBackup(bot, first, "jeton")
+    first.set("tiktok_tokens", {"refresh_token": "r"})
+    first.set("auto_publish", True)
+    asyncio.run(b1._write())
+    assert bot.pinned["text"].startswith(HEADER) and "refresh" not in bot.pinned["text"]
+
+    fresh = Store(tmp_path / "b.db")                            # redémarrage : disque vide
+    b2 = TelegramBackup(bot, fresh, "jeton")
+    assert asyncio.run(b2.restore()) == 2
+    assert fresh.get("tiktok_tokens") == {"refresh_token": "r"} and fresh.get("auto_publish") is True
+    fresh.set("paused", True)
+    asyncio.run(b2._write())
+    assert bot.calls.count("sendMessage") == 1 and "editMessageText" in bot.calls

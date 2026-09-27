@@ -321,10 +321,14 @@ class TrendScanner:
 
     def __init__(self, cfg: DiscoveryConfig, session: aiohttp.ClientSession,
                  extra_channels: Callable[[], list[str]] = lambda: [],
-                 on_resolved: Callable[[Resolution], None] | None = None):
+                 on_resolved: Callable[[Resolution], None] | None = None,
+                 perf: Callable[[], dict] = lambda: {}):
         self.cfg = cfg
         self.extra_channels = extra_channels
         self.on_resolved = on_resolved
+        # Multiplicateur par chaîne appris de la vraie performance TikTok (clipbot.analytics) :
+        # les chaînes dont les clips font plus de vues gagnent du temps de veille en plus.
+        self.perf = perf
         self.twitch = TwitchDiscovery(cfg, session)
         self.youtube = YouTubeDiscovery(cfg, session)
         self.kick = KickDiscovery(cfg, session)
@@ -412,9 +416,11 @@ class TrendScanner:
         wanted = set(targets)
         live = [c for c in live if (c.platform, c.channel.lower()) in wanted]
         focus = {parse_spec(f)[1] for f in self.cfg.focus_channels}
+        perf = self.perf()
         for c in live:
             if c.channel.lower() in focus:
                 c.boost = self.cfg.focus_boost
+            c.boost *= perf.get(c.channel.lower(), 1.0)
         live.sort(key=lambda c: c.weight, reverse=True)
         top = ", ".join(f"{c.channel}({c.platform.value[0]}{'★' if c.boost > 1 else ''}) {c.viewers}"
                         for c in live[:6])

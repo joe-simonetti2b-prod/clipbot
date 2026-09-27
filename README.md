@@ -89,6 +89,17 @@ seul changement par cycle. La file de montage alterne entre les créateurs.
 | `/tag @compte` · `/outro on/off` | tag incrusté sur les vidéos · fin « S'abonner / Partager » |
 | `/relance` | renvoyer tout de suite la file vers TikTok |
 | `/whop nom taux règles…` · `/whop off nom` · `/whop` | suivre une campagne Whop : ajoute les règles à la légende et renvoie le lien de la vidéo une fois publiée |
+
+### Croissance automatique
+Le bot apprend tout seul, à partir des vraies vues TikTok de chaque chaîne (une fois les
+statistiques actives), quelles chaînes suivies performent le mieux, et leur donne
+automatiquement plus de temps de veille (jusqu'à 1,8×) — celles qui font moins en reçoivent
+un peu moins (jusqu'à 0,7×). Rien à configurer, ça s'ajuste tout seul au fil des clips publiés.
+
+Whop n'a pas d'API publique et sa liste de campagnes n'est consultable qu'une fois connecté :
+impossible de la surveiller depuis le bot. Il t'envoie donc un rappel régulier (toutes les 48 h)
+avec la liste des chaînes que tu suis et qui n'ont pas encore de campagne enregistrée, pour que
+tu ailles vérifier en 30 secondes dans l'app — puis `/whop` pour l'intégrer.
 | `/pause` · `/resume` | couper / relancer la surveillance |
 | `/tiktok` | lien de connexion TikTok (une fois) |
 

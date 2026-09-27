@@ -26,6 +26,8 @@ FIRST_RUN_DELAY_S = 300
 MATCH_WINDOW_S = (300, 3600 * 3)     # une vidéo publiée entre 5 min et 3h après l'appel
 REWARDS_FOLLOWERS = 10_000
 REWARDS_VIEWS_30D = 100_000
+MIN_SAMPLES = 2          # en dessous, pas assez de données : pas de boost/malus
+BOOST_MIN, BOOST_MAX = 0.7, 1.8   # borné pour ne pas s'emballer sur un seul clip viral
 
 
 class TikTokAnalytics:
@@ -61,7 +63,34 @@ class TikTokAnalytics:
                             if now - float(v.get("create_time", now)) < 30 * 86400)
             self.store.set("tiktok_views_30d", {"views": views_30d, "at": now})
             self._match(videos)
+        self._update_channel_boost()
         await self._check_rewards()
+
+    def _update_channel_boost(self) -> None:
+        """Stratégie de croissance automatique : les chaînes dont les clips font
+        vraiment plus de vues sur TikTok gagnent plus de temps de veille (via
+        TrendScanner.perf) ; celles qui font moins en perdent un peu. Basé sur au
+        moins 2 clips reliés à une vraie vidéo, jamais sur un seul coup de chance."""
+        rows = self.store.db.execute(
+            "SELECT channel, tiktok_views FROM clips WHERE tiktok_video_id IS NOT NULL "
+            "AND tiktok_views IS NOT NULL ORDER BY published_at DESC LIMIT 200").fetchall()
+        if len(rows) < MIN_SAMPLES * 2:
+            return
+        by_channel: dict[str, list[int]] = {}
+        for r in rows:
+            by_channel.setdefault((r["channel"] or "").lower(), []).append(r["tiktok_views"] or 0)
+        overall = sum(v for vs in by_channel.values() for v in vs) / sum(len(vs) for vs in by_channel.values())
+        if overall <= 0:
+            return
+        boost = {}
+        for ch, vs in by_channel.items():
+            if len(vs) < MIN_SAMPLES:
+                continue
+            avg = sum(vs) / len(vs)
+            boost[ch] = round(max(BOOST_MIN, min(BOOST_MAX, avg / overall)), 2)
+        if boost:
+            self.store.set("channel_perf_boost", boost)
+            log.info("Croissance : pondération par chaîne mise à jour -> %s", boost)
 
     def _match(self, videos: list[dict]) -> None:
         rows = self.store.db.execute(

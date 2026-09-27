@@ -982,3 +982,47 @@ def test_whop_command_registers_and_applies_to_caption():
         out2 = await app.tg.commands["whop"]([])
         assert "nico_la" in out2
     asyncio.run(scenario())
+
+
+def test_channel_performance_boost_learned_from_real_views(tmp_path):
+    from clipbot.analytics import TikTokAnalytics
+    store = Store(tmp_path / "perf.db")
+    # nico_la performe bien au-dessus de la moyenne, byilhan en dessous
+    for views in (20000, 18000):
+        store.add_clip(platform="twitch", channel="nico_la", stream_url="x", status="published",
+                       tiktok_video_id=f"v{views}", tiktok_views=views, published_at=1.0)
+    for views in (500, 700):
+        store.add_clip(platform="twitch", channel="byilhan", stream_url="x", status="published",
+                       tiktok_video_id=f"b{views}", tiktok_views=views, published_at=1.0)
+
+    class FakeTikTok:
+        connected = True
+        analytics = True
+        async def creator_stats(self): return None
+        async def video_list(self, max_count=30): return []
+
+    async def notify(_): pass
+    a = TikTokAnalytics(store, FakeTikTok(), notify)
+    a._update_channel_boost()
+    boost = store.get("channel_perf_boost")
+    assert boost["nico_la"] > 1.0 > boost["byilhan"]
+    # borné : jamais au-delà de [0.7, 1.8] même avec un écart énorme
+    assert 0.7 <= boost["byilhan"] <= 1.8 and 0.7 <= boost["nico_la"] <= 1.8
+
+
+def test_scan_applies_learned_performance_boost(monkeypatch):
+    from clipbot.discovery import TrendScanner
+    from clipbot.config import DiscoveryConfig
+    cfg = DiscoveryConfig(allowed_channels=["nico_la", "byilhan"])
+    scanner = TrendScanner(cfg, session=None, perf=lambda: {"nico_la": 1.8, "byilhan": 0.7})
+    a, b = _cand("nico_la", 10000), _cand("byilhan", 10000)
+
+    async def fake_twitch_live(names, probe_until):
+        return [a, b]
+    scanner._twitch_live = fake_twitch_live
+    scanner.resolution = type("R", (), {
+        "targets": [(Platform.TWITCH, "nico_la"), (Platform.TWITCH, "byilhan")], "at": 10**12})()
+    scanner._resolved_for = tuple(scanner.specs())
+    live = asyncio.run(scanner.scan())
+    weights = {c.channel: c.weight for c in live}
+    assert weights["nico_la"] > weights["byilhan"]

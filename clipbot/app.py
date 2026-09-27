@@ -335,6 +335,7 @@ class App:
                 ("janitor", self.pipeline.run_janitor()),
                 ("telegram", self.tg.run()),
                 ("keepalive", self._keepalive(session)),
+                ("whop_reminder", self._whop_reminder()),
                 ("backup", self.backup.run()),
                 ("harvester", self.harvester.run()),
                 ("tt_analytics", self.tt_analytics.run()),
@@ -387,6 +388,30 @@ class App:
             links.append(f"YouTube : {base}/youtube/login?k={k}")
         if links:
             await self.tg.send("🔑 Reconnexion nécessaire (un tap chacun) :\n" + "\n".join(links))
+
+    async def _whop_reminder(self) -> None:
+        """Whop n'a pas d'API publique et sa liste de campagnes n'est pas consultable
+        sans être connecté : impossible de la scanner depuis ici. À la place, un rappel
+        régulier avec la liste de tes chaînes pas encore couvertes, pour aller vérifier
+        en 30 secondes dans l'app quelles ont une campagne de clipping ouverte."""
+        await asyncio.sleep(6 * 3600)
+        while True:
+            try:
+                from .discovery import parse_spec
+                followed = {parse_spec(f)[1] for f in self.s.discovery.focus_channels} \
+                    | {w.c.channel.lower() for w in self.orch.watchers.values()}
+                covered = set(self.store.get("whop_campaigns", {}))
+                todo = sorted(followed - covered)
+                if todo:
+                    await self.tg.send(
+                        "🔎 Pense à vérifier sur Whop (whop.com/discover) si une campagne de "
+                        f"clipping est ouverte pour : {', '.join(todo)}.\n"
+                        "Dès que tu en rejoins une : /whop <chaîne> <taux> <règles éventuelles>.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("Rappel Whop impossible : %s", e)
+            await asyncio.sleep(48 * 3600)
 
     async def _keepalive(self, session: aiohttp.ClientSession) -> None:
         """Render gratuit endort le service après 15 min sans requête entrante :

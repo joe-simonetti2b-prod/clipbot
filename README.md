@@ -69,6 +69,9 @@ Chaque clip arrive ensuite avec ✅ Publier / ❌ Jeter.
 et Kick**, le garde partout où il existe, et t'envoie sur Telegram la liste des pseudos
 introuvables. `kick:pseudo` ou `twitch:pseudo` forcent une plateforme.
 
+`FOCUS_CHANNELS` : créateurs prioritaires (ex. la scène française). Leurs viewers comptent
+`FOCUS_BOOST` fois (3 par défaut) : un live FR à 20 000 viewers passe devant un live US à 50 000.
+
 Toutes les 5 minutes, le bot compare le nombre de viewers de toutes les chaînes en live
 et suit les **2 plus regardées**. La rotation est progressive : un live suivi n'est
 remplacé que par un live 1,3× plus regardé, après au moins 10 minutes de suivi, et un

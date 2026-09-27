@@ -130,7 +130,10 @@ class App:
                 return "Vérification des pseudos en cours…"
             watched = ", ".join(f"{w.c.channel} ({w.c.platform.value}, {w.c.viewers} viewers)"
                                 for w in self.orch.watchers.values()) or "aucun"
-            return (f"{r.summary()}\n\nTwitch : {', '.join(r.twitch) or '—'}\n"
+            focus = [parse_spec(f)[1] for f in self.s.discovery.focus_channels]
+            head = (f"★ Focus (priorité ×{self.s.discovery.focus_boost:g}) : {', '.join(focus)}\n\n"
+                    if focus else "")
+            return (f"{head}{r.summary()}\n\nTwitch : {', '.join(r.twitch) or '—'}\n"
                     f"Kick : {', '.join(r.kick) or '—'}\n\nEn cours de suivi : {watched}")
 
         async def youtube(_):

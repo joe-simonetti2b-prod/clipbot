@@ -24,6 +24,12 @@ class StreamCandidate:
     language: str = ""
     chat_ref: str = ""           # canal IRC / liveChatId YouTube / chatroom Kick
     hls_url: str = ""            # flux vidéo direct (Kick) : lu par FFmpeg sans yt-dlp
+    boost: float = 1.0           # priorité (créateurs « focus » : x3 par défaut)
+
+    @property
+    def weight(self) -> float:
+        """Poids de classement : viewers × priorité du créateur."""
+        return self.viewers * self.boost
 
     @property
     def key(self) -> str:

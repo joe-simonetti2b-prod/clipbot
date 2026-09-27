@@ -411,8 +411,13 @@ class TrendScanner:
                 live += r
         wanted = set(targets)
         live = [c for c in live if (c.platform, c.channel.lower()) in wanted]
-        live.sort(key=lambda c: c.viewers, reverse=True)
-        top = ", ".join(f"{c.channel}({c.platform.value[0]}) {c.viewers}" for c in live[:5])
+        focus = {parse_spec(f)[1] for f in self.cfg.focus_channels}
+        for c in live:
+            if c.channel.lower() in focus:
+                c.boost = self.cfg.focus_boost
+        live.sort(key=lambda c: c.weight, reverse=True)
+        top = ", ".join(f"{c.channel}({c.platform.value[0]}{'★' if c.boost > 1 else ''}) {c.viewers}"
+                        for c in live[:6])
         log.info("Veille : %d lives en cours%s", len(live), f" — {top}" if top else "")
         return live
 

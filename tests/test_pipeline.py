@@ -669,3 +669,13 @@ def test_resolution_drops_homonym_accounts():
     assert (Platform.KICK, "westcol") in r.targets and (Platform.TWITCH, "westcol") in r.targets
     assert (Platform.KICK, "xqc") in r.targets          # 900k abonnés : vrai compte, gardé
     assert any("squeezie" in h for h in r.homonyms)
+
+
+def test_french_focus_outranks_bigger_us_stream():
+    from clipbot.watcher import plan_rotation
+    fr = _cand("kamet0", 20000)
+    fr.boost = 3.0                                   # 20 000 × 3 = 60 000
+    us1, us2 = _cand("kaicenat", 50000), _cand("xqc", 40000)
+    stop, start = plan_rotation({}, sorted([us1, us2, fr], key=lambda c: c.weight, reverse=True),
+                                2, 1.3, 600, now=0)
+    assert [c.channel for c in start] == ["kamet0", "kaicenat"]

@@ -108,7 +108,7 @@ def plan_rotation(watched: dict[str, tuple[StreamCandidate, float]],
       * un live terminé est lâché ;
       * les places libres vont aux lives les plus regardés ;
       * rotation progressive : au plus UN remplacement par cycle, seulement si le
-        nouveau live a `ratio`× plus de viewers que le moins regardé des suivis,
+        nouveau live a `ratio`× plus de poids (viewers × priorité) que le plus faible,
         et si ce dernier est suivi depuis au moins `min_watch_s` ;
       * jamais deux fois le même créateur (Twitch + Kick en simultané).
     """
@@ -129,8 +129,8 @@ def plan_rotation(watched: dict[str, tuple[StreamCandidate, float]],
                 and c.channel.lower() not in {x.channel.lower() for x in start}]
         if rest:
             best = rest[0]
-            weakest_key, (weakest, since) = min(kept.items(), key=lambda kv: kv[1][0].viewers)
-            if now - since >= min_watch_s and best.viewers >= max(1, weakest.viewers) * ratio:
+            weakest_key, (weakest, since) = min(kept.items(), key=lambda kv: kv[1][0].weight)
+            if now - since >= min_watch_s and best.weight >= max(1, weakest.weight) * ratio:
                 stop.append(weakest_key)
                 start.append(best)
     return stop, start
@@ -208,6 +208,7 @@ class Orchestrator:
         for k, w in self.watchers.items():
             if k in live_by_key:
                 w.c.viewers = live_by_key[k].viewers   # affichage /status à jour
+                w.c.boost = live_by_key[k].boost
         for key in stop:
             w = self.watchers.pop(key, None)
             if w:

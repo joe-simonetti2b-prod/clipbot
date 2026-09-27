@@ -54,6 +54,9 @@ class DiscoveryConfig:
     min_viewers: int = _env("MIN_VIEWERS", "1500", int)
     max_concurrent_streams: int = _env("MAX_CONCURRENT_STREAMS", "3", int)
     poll_interval_s: int = _env("DISCOVERY_INTERVAL_S", "300", int)
+    # Créateurs prioritaires (ex. focus FR) : leurs viewers comptent FOCUS_BOOST fois
+    focus_channels: list[str] = field(default_factory=lambda: _env_list("FOCUS_CHANNELS"))
+    focus_boost: float = _env("FOCUS_BOOST", "3", float)
     # Rotation : un live suivi n'est remplacé que par un live nettement plus regardé
     switch_ratio: float = _env("SWITCH_RATIO", "1.3", float)
     min_watch_s: int = _env("MIN_WATCH_S", "600", int)          # durée minimale de suivi

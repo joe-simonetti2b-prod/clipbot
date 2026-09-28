@@ -17,7 +17,9 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
+import signal
 import time
 from pathlib import Path
 from typing import Callable
@@ -107,8 +109,9 @@ class ClipHarvester:
     def submit(self, url: str) -> str:
         """Lien de clip envoyé par le propriétaire au bot : monté pour NOTRE compte,
         quelle que soit la chaîne, en priorité maximale."""
-        if urlparse(url).hostname not in ALLOWED_HOSTS:
-            return "Lien non pris en charge (clips Twitch ou Kick uniquement)."
+        url = clip_url(url)
+        if not url:
+            return "Lien non pris en charge : envoie le lien d'un CLIP Twitch ou Kick."
         cid = clip_id(url)
         if self._known(cid):
             return "Ce clip est déjà passé par le bot."
@@ -235,6 +238,13 @@ class ClipHarvester:
         await self.queue.put((c, url, "top clip du jour", float(best.get("viewCount") or 0)))
 
 
+def clip_url(url: str) -> str:
+    """Lien de clip Twitch/Kick normalisé, ou "" si ce n'en est pas un (ex : une chaîne)."""
+    from .watcher import CLIP_LINK_RE
+    m = CLIP_LINK_RE.match(url.strip())
+    return m.group(0) if m else ""
+
+
 def broadcaster(info: dict) -> str:
     """Chaîne d'origine d'un clip (et non la personne qui l'a clippé)."""
     for k in ("channel", "uploader_id", "uploader"):
@@ -249,25 +259,39 @@ async def download_clip(url: str, dest: Path, res=None) -> tuple[Path, dict, flo
     (mémoire limitée) et en priorité basse. Renvoie (fichier, infos, durée)."""
     if urlparse(url).hostname not in ALLOWED_HOSTS:
         raise RuntimeError(f"hôte non autorisé : {url}")
+    # Uniquement un vrai lien de CLIP (jamais une chaîne en direct : yt-dlp enregistrerait
+    # le live sans fin). On ne passe à yt-dlp que la partie reconnue du lien.
+    url = clip_url(url)
+    if not url:
+        raise RuntimeError("ce n'est pas un lien de clip Twitch/Kick")
     dest.mkdir(parents=True, exist_ok=True)
     base = dest / f"clip_{re.sub(r'[^a-z0-9_-]', '', clip_id(url))[:60]}_{int(time.time())}"
     cmd = niced(["yt-dlp", "--quiet", "--no-warnings", "--no-playlist", "--no-part",
-                 "-f", "best[height<=720]/best", "--max-filesize", "120M",
-                 "--write-info-json", "-o", f"{base}.%(ext)s", url])
+                 "--match-filter", "!is_live", "-f", "best[height<=720]/best",
+                 "--max-filesize", "120M", "--write-info-json", "-o", f"{base}.%(ext)s", url])
 
     async def run():
+        # Groupe de processus à part : en cas de dépassement on tue AUSSI les ffmpeg
+        # lancés par yt-dlp (sinon ils continueraient à tourner en arrière-plan).
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True)
         try:
             _, err = await asyncio.wait_for(proc.communicate(), 180)
         except asyncio.TimeoutError:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            for p in dest.glob(base.name + "*"):
+                p.unlink(missing_ok=True)
             raise RuntimeError("téléchargement trop long")
         return proc.returncode, err
 
     if res is not None:
         async with res.heavy:
-            await res.wait_room(120, max_wait_s=300)
+            await res.wait_room(120, max_wait_s=120)
             code, err = await run()
     else:
         code, err = await run()

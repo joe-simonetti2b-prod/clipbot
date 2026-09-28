@@ -32,7 +32,7 @@ from typing import Callable
 import aiohttp
 
 from .config import Settings
-from .harvest import ALLOWED_HOSTS, broadcaster, download_clip
+from .harvest import broadcaster, clip_url, download_clip
 from .resources import Resources
 from .storage import Store
 from .telegram import TelegramBot, copyable
@@ -62,14 +62,24 @@ class Pack:
 
 
 def parse_packs(spec: str) -> list[Pack]:
+    """Clé stable dérivée du contenu (« 10c450s ») : modifier ou réordonner SHOP_PACKS
+    ne peut jamais faire créditer un autre pack que celui payé."""
     out = []
-    for i, part in enumerate(x for x in spec.split(",") if x.strip()):
+    for part in (x for x in spec.split(",") if x.strip()):
         try:
             c, s, e = part.strip().split(":")
-            out.append(Pack(f"p{i}", int(c), int(s), float(e)))
+            if int(c) > 0 and int(s) > 0:
+                out.append(Pack(f"{int(c)}c{int(s)}s", int(c), int(s), float(e)))
         except ValueError:
             log.warning("Pack ignoré (format crédits:étoiles:euros) : %r", part)
-    return out or [Pack("p0", 3, 150, 2.0)]
+    return out or [Pack("3c150s", 3, 150, 2.0)]
+
+
+def pack_credits(key: str) -> int:
+    try:
+        return int(key.split("c", 1)[0])
+    except ValueError:
+        return 0
 
 
 class Shop:
@@ -259,12 +269,12 @@ class Shop:
 
     # ------------------------------------------------------------ commandes
     async def order(self, uid: int, cid: int, url: str, name: str) -> None:
-        from urllib.parse import urlparse
-        url = url.strip().strip("<>")
-        if urlparse(url).hostname not in ALLOWED_HOSTS:
-            return await self.bot.reply(cid, "❌ Lien non pris en charge : clips Twitch ou Kick "
-                                             "uniquement (clips.twitch.tv/…, twitch.tv/…/clip/…, "
-                                             "kick.com/…?clip=…).")
+        url = clip_url(url.strip().strip("<>"))
+        if not url:
+            return await self.bot.reply(cid, "❌ Lien non pris en charge : envoie le lien d'un "
+                                             "CLIP Twitch ou Kick (clips.twitch.tv/…, "
+                                             "twitch.tv/…/clip/…, kick.com/…?clip=…), pas d'une "
+                                             "chaîne ou d'un live.")
         self.customer(uid, name)
         if self.available(uid) < 1:
             return await self.bot.reply(cid, "Plus de crédit. " + self.prices_text(), self.buy_rows())
@@ -324,8 +334,7 @@ class Shop:
 
     async def deliver(self, row: dict, path: Path, copy) -> None:
         uid, chat = row["customer_id"], row["customer_chat"]
-        c = self.customer(uid)
-        left = c.get("credits", 0) - 1
+        left = max(0, self.customer(uid).get("credits", 0) - 1)     # estimation pour le message
         head = (f"✅ Ton clip est prêt ! 1 crédit utilisé, il t'en reste {left}."
                 + (f"\nAccroche : {copy.hook}" if getattr(copy, "hook", "") else ""))
         caption = (html.escape(head, quote=False) + "\n\n👇 légende + hashtags (tap pour copier)\n"
@@ -338,7 +347,9 @@ class Shop:
             await self.bot.reply(chat, "❌ La vidéo n'a pas pu être envoyée. Aucun crédit utilisé, "
                                        "renvoie le lien.")
             return
-        self._update(uid, credits=left, clips=c.get("clips", 0) + 1)
+        # Solde relu APRÈS l'envoi (qui peut durer) : un achat fait pendant ce temps est gardé
+        c = self.customer(uid)
+        self._update(uid, credits=max(0, c.get("credits", 0) - 1), clips=c.get("clips", 0) + 1)
         self.store.update_clip(row["id"], status="delivered", final_path=None)
         path.unlink(missing_ok=True)
         log.info("Boutique : clip %s livré à %s (reste %d)", row["id"], uid, left)
@@ -386,8 +397,10 @@ class Shop:
         pays = self.store.get("shop_payments", [])
         if any(x.get("charge") == charge for x in pays):
             return                                  # déjà crédité
-        p = self.pack((sp.get("invoice_payload") or "").partition(":")[2])
-        credits = p.credits if p else max(1, sp.get("total_amount", 0) // 50)
+        # Crédits lus dans la clé du pack payé (fixée par nous dans la facture, validée au
+        # pre_checkout) : même si SHOP_PACKS change entre-temps, le client reçoit son dû.
+        credits = pack_credits((sp.get("invoice_payload") or "").partition(":")[2]) \
+            or max(1, sp.get("total_amount", 0) // 50)
         name = msg["from"].get("username") or msg["from"].get("first_name") or str(uid)
         c = self.customer(uid, name)
         self._update(uid, credits=c.get("credits", 0) + credits,
@@ -411,7 +424,10 @@ class Shop:
             return "Paiement crypto : rembourse-le depuis @CryptoBot, puis /offrir pour ajuster."
         await self.bot._call("refundStarPayment", json={"user_id": uid,
                                                         "telegram_payment_charge_id": charge})
-        pay["refunded"] = True
+        pays = self.store.get("shop_payments", [])          # relu après l'appel réseau
+        for x in pays:
+            if x.get("charge") == charge:
+                x["refunded"] = True
         self.store.set("shop_payments", pays)
         c = self.customer(uid)
         self._update(uid, credits=max(0, c.get("credits", 0) - pay["credits"]))
@@ -445,15 +461,40 @@ class Shop:
             paid_btn_name="openBot", paid_btn_url=f"https://t.me/{self.bot.username}?start=r_{code}",
             hidden_message=f"Ouvre le bot avec ce lien pour recevoir tes crédits : "
                            f"https://t.me/{self.bot.username}?start=r_{code}")
-        codes = self.store.get("shop_codes", {})
-        codes[code] = {"invoice": inv["invoice_id"], "pack": p.key, "at": time.time()}
-        # garde les 300 plus récents
-        self.store.set("shop_codes", dict(sorted(codes.items(), key=lambda kv: kv[1]["at"])[-300:]))
+        await self._prune_codes()
+        codes = self.store.get("shop_codes", {})            # relu après les appels réseau
+        codes[code] = {"invoice": inv["invoice_id"], "credits": p.credits, "eur": p.eur,
+                       "at": time.time()}
+        self.store.set("shop_codes", codes)
         return inv.get("web_app_invoice_url") or inv.get("bot_invoice_url")
 
-    async def redeem(self, uid: int, cid: int, code: str, name: str) -> None:
+    async def _prune_codes(self, keep: int = 150) -> None:
+        """Codes non utilisés de plus de 2 h (facture expirée au bout d'1 h) : on ne jette
+        que ceux que Crypto Pay confirme NON payés. Un code payé n'est jamais perdu."""
         codes = self.store.get("shop_codes", {})
-        entry = codes.get(code)
+        old = {k: v for k, v in codes.items()
+               if not v.get("used") and time.time() - v["at"] > 7200}
+        if len(codes) < keep or not old:
+            return
+        try:
+            res = await self._cryptopay("getInvoices",
+                                        invoice_ids=",".join(str(v["invoice"]) for v in old.values()),
+                                        count=1000)
+            paid = {i["invoice_id"] for i in res.get("items") or [] if i.get("status") == "paid"}
+        except Exception as e:
+            log.warning("Tri des codes crypto impossible : %s", e)
+            return
+        codes = self.store.get("shop_codes", {})
+        for k, v in old.items():
+            if v["invoice"] not in paid:
+                codes.pop(k, None)
+        # Codes utilisés : l'historique des paiements suffit au-delà de 60 jours
+        codes = {k: v for k, v in codes.items()
+                 if not (v.get("used") and time.time() - v["at"] > 60 * 86400)}
+        self.store.set("shop_codes", codes)
+
+    async def redeem(self, uid: int, cid: int, code: str, name: str) -> None:
+        entry = self.store.get("shop_codes", {}).get(code)
         if not entry:
             return await self.bot.reply(cid, "Code inconnu ou expiré.")
         if entry.get("used"):
@@ -468,18 +509,22 @@ class Shop:
         if inv.get("status") != "paid":
             return await self.bot.reply(cid, "Paiement pas encore reçu. Réessaie ce lien une fois "
                                              "le paiement confirmé.")
-        p = self.pack(entry["pack"])
+        codes = self.store.get("shop_codes", {})            # relu après l'appel réseau
+        entry = codes.get(code)
+        if not entry or entry.get("used"):
+            return await self.bot.reply(cid, "Ce code a déjà été utilisé.")
+        credits, eur = int(entry["credits"]), float(entry["eur"])
+        c = self.customer(uid, name)
+        self._update(uid, credits=c.get("credits", 0) + credits, eur=c.get("eur", 0) + eur)
         entry.update(used=True, uid=uid)
         codes[code] = entry
         self.store.set("shop_codes", codes)
-        c = self.customer(uid, name)
-        self._update(uid, credits=c.get("credits", 0) + p.credits, eur=c.get("eur", 0) + p.eur)
         pays = self.store.get("shop_payments", [])
-        pays.append({"uid": uid, "kind": "crypto", "amount": p.eur, "credits": p.credits,
+        pays.append({"uid": uid, "kind": "crypto", "amount": eur, "credits": credits,
                      "charge": f"cp{entry['invoice']}", "at": time.time()})
         self.store.set("shop_payments", pays[-500:])
-        await self.bot.reply(cid, f"🎉 Paiement reçu : +{p.credits} clips. Envoie-moi un lien de clip !")
-        await self.owner_bot.send(f"💰 Vente crypto : {p.eur:.2f} € de {name} (id {uid}).")
+        await self.bot.reply(cid, f"🎉 Paiement reçu : +{credits} clips. Envoie-moi un lien de clip !")
+        await self.owner_bot.send(f"💰 Vente crypto : {eur:.2f} € de {name} (id {uid}).")
 
     # ------------------------------------------------------------ propriétaire
     def summary(self) -> str:

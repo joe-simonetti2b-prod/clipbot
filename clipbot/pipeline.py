@@ -296,7 +296,9 @@ class Pipeline:
         if self.res is None:
             return await coro_fn()
         async with self.res.heavy:
-            await self.res.wait_room(200)
+            # ~170 Mo pour un montage 720p, 1 fil (FFMPEG_THREADS=1) ; au bout de 60 s
+            # d'attente un live est délesté, au bout de 5 min on monte quand même.
+            await self.res.wait_room(170, max_wait_s=300)
             return await coro_fn()
 
     async def _process(self, clip: dict) -> None:

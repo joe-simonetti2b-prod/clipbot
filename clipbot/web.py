@@ -218,11 +218,17 @@ def build_app(a: "App") -> web.Application:
         shop = getattr(a, "shop", None)
         if shop is None or not shop.enabled or not shop.crypto_enabled:
             raise web.HTTPNotFound(text="paiement crypto indisponible")
-        ip = req.headers.get("X-Forwarded-For", req.remote or "?").split(",")[0].strip()
-        hits = [t for t in invoice_hits.get(ip, []) if _t.time() - t < 3600]
-        if len(hits) >= 10:
+        # Dernière adresse de X-Forwarded-For = celle vue par le proxy de l'hébergeur
+        # (les précédentes peuvent être inventées par le client).
+        ip = req.headers.get("X-Forwarded-For", req.remote or "?").split(",")[-1].strip()
+        now = _t.time()
+        for k in list(invoice_hits):
+            invoice_hits[k] = [t for t in invoice_hits[k] if now - t < 3600]
+            if not invoice_hits[k]:
+                del invoice_hits[k]
+        if len(invoice_hits.get(ip, [])) >= 10 or sum(map(len, invoice_hits.values())) >= 40:
             raise web.HTTPTooManyRequests(text="trop de tentatives, réessaie plus tard")
-        invoice_hits[ip] = hits + [_t.time()]
+        invoice_hits.setdefault(ip, []).append(now)
         try:
             url = await shop.crypto_invoice(req.match_info["pack"])
         except Exception as e:

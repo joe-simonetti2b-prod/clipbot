@@ -194,13 +194,18 @@ class TelegramBot:
         except Exception as e:
             log.warning("Telegram getMe : %s", e)
         cmds = lambda menu: [{"command": c, "description": d} for c, d in menu]
-        if self.public_menu and self.owner and not self.public_only:
-            # Même bot pour toi et les clients : chacun voit son propre menu
-            await self._call("setMyCommands", json={"commands": cmds(self.public_menu)})
-            await self._call("setMyCommands", json={
-                "commands": cmds(self.menu), "scope": {"type": "chat", "chat_id": self.owner}})
-        else:
-            await self._call("setMyCommands", json={"commands": cmds(self.menu)})
+        try:   # un souci réseau au démarrage ne doit jamais couper la télécommande
+            if self.public_menu and self.owner and not self.public_only:
+                # Même bot pour toi et les clients : chacun voit son propre menu
+                await self._call("setMyCommands", json={"commands": cmds(self.public_menu)})
+                await self._call("setMyCommands", json={
+                    "commands": cmds(self.menu), "scope": {"type": "chat", "chat_id": self.owner}})
+            else:
+                await self._call("setMyCommands", json={"commands": cmds(self.menu)})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("Telegram setMyCommands : %s", e)
         offset = self.store.get(self.offset_key, 0)
         while True:
             try:

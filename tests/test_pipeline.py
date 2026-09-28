@@ -1221,11 +1221,13 @@ def test_shop_order_priority_delivery_and_credits(tmp_path, monkeypatch):
         assert sh.customer(7)["credits"] == 1 and "offert" in bot.replies[-1][1]
         await sh.handle(_msg(7, "https://evil.com/clip/x"))
         assert "non pris en charge" in bot.replies[-1][1]
+        await sh.handle(_msg(7, "/clip https://www.twitch.tv/xqc"))        # un live : refusé
+        assert "non pris en charge" in bot.replies[-1][1] and sh.pending() == 0
         await sh.handle(_msg(7, "/tag moncompte"))
         await sh.handle(_msg(7, "regarde https://clips.twitch.tv/SuperClipAbc"))
         await asyncio.gather(*sh._tasks)
         assert woke and sh.pending(7) == 1 and sh.available(7) == 0
-        await sh.handle(_msg(7, "https://clips.twitch.tv/Autre"))          # plus de crédit
+        await sh.handle(_msg(7, "https://clips.twitch.tv/AutreClip"))          # plus de crédit
         assert "Plus de crédit" in bot.replies[-1][1] and bot.replies[-1][2]
         row = store.db.execute("SELECT * FROM clips WHERE customer_id=7").fetchone()
         assert row["customer_tag"] == "@moncompte" and row["channel"] == "kamet0"
@@ -1255,9 +1257,9 @@ def test_shop_failure_costs_nothing_and_group_needs_command(tmp_path, monkeypatc
     sh, store, bot, _ = _shop(tmp_path, monkeypatch, free_trial=2)
 
     async def scenario():
-        await sh.handle(_msg(8, "https://clips.twitch.tv/Abc", chat=-100, ctype="group"))
+        await sh.handle(_msg(8, "https://clips.twitch.tv/AbcDefGh", chat=-100, ctype="group"))
         assert not bot.replies                                       # groupe : sans /clip, rien
-        await sh.handle(_msg(8, "/clip@clipshop_bot https://clips.twitch.tv/Abc", chat=-100,
+        await sh.handle(_msg(8, "/clip@clipshop_bot https://clips.twitch.tv/AbcDefGh", chat=-100,
                              ctype="group"))
         await asyncio.gather(*sh._tasks)
         row = dict(store.db.execute("SELECT * FROM clips WHERE customer_id=8").fetchone())
@@ -1272,19 +1274,19 @@ def test_shop_stars_payment_is_validated_credited_once_and_refundable(tmp_path, 
     sh, store, bot, _ = _shop(tmp_path, monkeypatch, free_trial=0, packs="10:450:6")
 
     async def scenario():
-        await sh.handle({"callback_query": {"id": "q", "from": {"id": 9}, "data": "shop:buy:p0",
+        await sh.handle({"callback_query": {"id": "q", "from": {"id": 9}, "data": "shop:buy:10c450s",
                                             "message": {"chat": {"id": 9}}}})
         inv = next(b for m, b in bot.calls if m == "sendInvoice")
         assert inv["currency"] == "XTR" and inv["prices"][0]["amount"] == 450
         pcq = lambda amount: {"pre_checkout_query": {"id": "c", "from": {"id": 9}, "currency": "XTR",
-                                                     "total_amount": amount, "invoice_payload": "pack:p0"}}
+                                                     "total_amount": amount, "invoice_payload": "pack:10c450s"}}
         await sh.handle(pcq(1))                                      # montant trafiqué
         await sh.handle(pcq(450))
         answers = [b["ok"] for m, b in bot.calls if m == "answerPreCheckoutQuery"]
         assert answers == [False, True]
         paid = {"message": {"chat": {"id": 9}, "from": {"id": 9, "username": "bob"},
                             "successful_payment": {"currency": "XTR", "total_amount": 450,
-                                                   "invoice_payload": "pack:p0",
+                                                   "invoice_payload": "pack:10c450s",
                                                    "telegram_payment_charge_id": "ch_1"}}}
         await sh.handle(paid)
         await sh.handle(paid)                                        # doublon ignoré
@@ -1309,7 +1311,7 @@ def test_shop_crypto_code_is_verified_and_single_use(tmp_path, monkeypatch):
     sh._cryptopay = fake_cp
 
     async def scenario():
-        assert await sh.crypto_invoice("p0") == "https://pay/55"
+        assert await sh.crypto_invoice("3c150s") == "https://pay/55"
         code = next(iter(store.get("shop_codes")))
         await sh.handle(_msg(3, f"/start r_{code}"))
         assert "pas encore reçu" in bot.replies[-1][1] and sh.customer(3)["credits"] == 0
@@ -1430,3 +1432,16 @@ def test_customer_clip_is_rendered_with_their_tag_and_delivered(tmp_path, source
     row, path = delivered[0]
     assert row["status"] == "delivering" and path.exists()
     assert captured["watermark"] == "@client" and "NOTRE compte" not in (row["caption"] or "")
+
+
+def test_only_real_clip_links_are_downloaded(tmp_path):
+    from clipbot.harvest import clip_url, download_clip
+    assert clip_url("https://clips.twitch.tv/FunnyClipName-abc123?filter=x") == \
+        "https://clips.twitch.tv/FunnyClipName-abc123"
+    assert clip_url("https://www.twitch.tv/xqc/clip/SlugSlugSlug") == \
+        "https://www.twitch.tv/xqc/clip/SlugSlugSlug"
+    assert clip_url("https://kick.com/n3on?clip=clip_01ABCD") == "https://kick.com/n3on?clip=clip_01ABCD"
+    for live in ("https://www.twitch.tv/xqc", "https://kick.com/adinross", "https://twitch.tv/videos/123"):
+        assert clip_url(live) == ""
+        with pytest.raises(RuntimeError, match="pas un lien de clip"):
+            asyncio.run(download_clip(live, tmp_path))

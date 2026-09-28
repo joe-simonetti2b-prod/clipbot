@@ -62,9 +62,7 @@ class App:
                               f"{w.clips} clips)" for w in self.orch.watchers.values()) or "  aucun"
             tt = ("non configuré" if not self.tiktok.configured else
                   f"connecté ({self.tiktok.mode})" if self.tiktok.connected else "à connecter → /tiktok")
-            if time.time() < self.pipeline.tiktok_full_until:
-                tt += (f"\n  🟡 5 vidéos en attente dans TikTok (publie-les) · "
-                       f"{self.pipeline.waiting_count()} clips en file")
+            tt += self.pipeline.tiktok_status_line()
             tt += self.tt_analytics.status_line()
             yt = ("non configuré" if not self.youtube.configured else
                   "connecté" if self.youtube.connected else "à connecter → /youtube")
@@ -73,6 +71,7 @@ class App:
                     f"Lives suivis :\n{lives}\n\n24 h : "
                     f"{sum(n.values())} clips · {n.get('ready', 0)} à valider · "
                     f"{n.get('published', 0)} publiés · {n.get('discarded', 0)} jetés par l'IA · "
+                    f"{n.get('manual', 0)} à poster à la main · "
                     f"{n.get('failed', 0)} erreurs · {n.get('skipped', 0)} écartés (file pleine)\n"
                     f"TikTok : {tt}\nYouTube : {yt}")
 
@@ -88,10 +87,14 @@ class App:
             return "Publication automatique : OFF — chaque clip attend ton ✅. /auto pour activer."
 
         async def relance(_):
+            # Ignore l'espacement et la plage horaire pendant 20 min (ex : tu viens de
+            # publier tes brouillons et tu veux la suite tout de suite).
             n = self.pipeline.waiting_count()
             self.pipeline.tiktok_full_until = 0
+            self.pipeline.force_until = time.time() + 20 * 60
             self.pipeline._publish_wake.set()
-            return (f"🚀 J'envoie les {n} clips en file vers TikTok." if n
+            return (f"🚀 J'envoie maintenant les {n} clips en file vers TikTok "
+                    "(TikTok en accepte 5 non publiés à la fois)." if n
                     else "Aucun clip en file d'attente.")
 
         # ---------------- choix manuel des lives (l'algorithme garde les places libres)

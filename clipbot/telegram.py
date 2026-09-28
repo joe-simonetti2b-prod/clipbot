@@ -12,12 +12,14 @@ Télécommande Telegram : ton tableau de bord depuis le téléphone.
   /tiktok         lien de connexion TikTok (une seule fois)
   /youtube        lien de connexion YouTube Shorts (une seule fois)
 
-Chaque clip prêt arrive en vidéo avec deux boutons : ✅ Publier / ❌ Jeter.
+Chaque clip prêt arrive en vidéo, légende copiable d'un tap, avec ses boutons
+(✅ Publier / ❌ Jeter / 📲 Déjà posté à la main).
 API Bot HTTP brute (long polling) : aucune dépendance, aucun webhook à régler.
 """
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 from pathlib import Path
@@ -36,6 +38,20 @@ def _keyboard(rows: list[list[tuple[str, str]]]) -> list[list[dict]]:
     return [[{"text": t[:60], "callback_data": d[:64]} for t, d in row] for row in rows if row]
 
 
+def copyable(text: str, limit: int = 3500) -> str:
+    """Texte en police à chasse fixe : sur Telegram mobile, un tap le copie en entier
+    (légende + hashtags prêts à coller dans TikTok)."""
+    return f"<code>{html.escape(text[:limit], quote=False)}</code>"
+
+
+def clip_caption(header: str, caption: str) -> str:
+    # Légende vidéo Telegram : 1024 caractères max (balises non comptées)
+    head = header[:300]
+    room = 1000 - len(head) - 30
+    return (f"{html.escape(head, quote=False)}\n\n👇 légende (tap pour copier)\n"
+            f"{copyable(caption, max(room, 100))}")
+
+
 class TelegramBot:
     def __init__(self, token: str, pair_code: str, store: Store, session: aiohttp.ClientSession,
                  owner_id: str = ""):
@@ -48,6 +64,7 @@ class TelegramBot:
         self.commands: dict[str, Handler] = {}
         self.on_approve: Callable[[int], Awaitable[str]] | None = None
         self.on_reject: Callable[[int], Awaitable[str]] | None = None
+        self.on_done: Callable[[int], Awaitable[str]] | None = None   # posté à la main
         # Autres boutons : {"préfixe": handler(argument) -> (texte, nouveau clavier | None)}
         self.callbacks: dict[str, Callable[[str], Awaitable[tuple[str, list | None]]]] = {}
 
@@ -64,14 +81,15 @@ class TelegramBot:
             raise RuntimeError(f"Telegram {method} : {data.get('description')}")
         return data["result"]
 
-    async def send(self, text: str, chat_id: int | None = None) -> None:
+    async def send(self, text: str, chat_id: int | None = None, html: bool = False) -> None:
         chat_id = chat_id or self.owner
         if not (self.enabled and chat_id):
             return
+        body = {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True}
+        if html:
+            body["parse_mode"] = "HTML"
         try:
-            await self._call("sendMessage", json={
-                "chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True,
-            })
+            await self._call("sendMessage", json=body)
         except Exception as e:
             log.warning("Envoi Telegram impossible : %s", e)
 
@@ -86,16 +104,18 @@ class TelegramBot:
         except Exception as e:
             log.warning("Envoi Telegram impossible : %s", e)
 
-    async def send_clip(self, clip_id: int, path: Path, caption: str, header: str) -> int | None:
+    async def send_clip(self, clip_id: int, path: Path, caption: str, header: str,
+                        buttons: list[list[tuple[str, str]]] | None = None) -> int | None:
         if not (self.enabled and self.owner):
             return None
-        keyboard = {"inline_keyboard": [[
-            {"text": "✅ Publier", "callback_data": f"pub:{clip_id}"},
-            {"text": "❌ Jeter", "callback_data": f"rej:{clip_id}"},
-        ]]}
+        if buttons is None:
+            buttons = [[("✅ Publier", f"pub:{clip_id}"), ("❌ Jeter", f"rej:{clip_id}")],
+                       [("📲 Déjà posté à la main", f"done:{clip_id}")]]
+        keyboard = {"inline_keyboard": _keyboard(buttons)}
         form = aiohttp.FormData()
         form.add_field("chat_id", str(self.owner))
-        form.add_field("caption", f"{header}\n\n{caption}"[:1024])
+        form.add_field("caption", clip_caption(header, caption))
+        form.add_field("parse_mode", "HTML")
         form.add_field("supports_streaming", "true")
         form.add_field("reply_markup", json.dumps(keyboard))
         try:
@@ -164,10 +184,20 @@ class TelegramBot:
                 except Exception:
                     pass   # message identique : Telegram refuse la modification, sans gravité
                 return
-            if action not in ("pub", "rej"):
+            handlers = {"pub": self.on_approve, "rej": self.on_reject, "done": self.on_done}
+            if action not in handlers or not cid.isdigit():
                 await self._call("answerCallbackQuery", json={"callback_query_id": cq["id"]})
                 return
-            handler = self.on_approve if action == "pub" else self.on_reject
+            # Base effacée à chaque redémarrage (Render gratuit) : les numéros de clips
+            # repartent de 1. Un vieux bouton ne doit jamais agir sur un autre clip.
+            row = self.store.clip(int(cid))
+            if not row or row["tg_message_id"] != cq["message"]["message_id"]:
+                await self._call("answerCallbackQuery", json={
+                    "callback_query_id": cq["id"], "show_alert": True,
+                    "text": "⌛ Bouton expiré (le bot a redémarré depuis). La vidéo reste "
+                            "utilisable : partage-la vers TikTok à la main."})
+                return
+            handler = handlers[action]
             reply = await handler(int(cid)) if handler else "?"
             await self._call("answerCallbackQuery", json={"callback_query_id": cq["id"],
                                                          "text": reply[:190]})

@@ -83,11 +83,12 @@ class FakeTelegram:
         self.clips, self.messages = [], []
         self.on_approve = self.on_reject = None
 
-    async def send_clip(self, cid, path, caption, header):
+    async def send_clip(self, cid, path, caption, header, buttons=None):
         self.clips.append((cid, path, caption, header))
+        self.buttons = buttons
         return 42
 
-    async def send(self, text, chat_id=None):
+    async def send(self, text, chat_id=None, html=False):
         self.messages.append(text)
 
 
@@ -1026,3 +1027,113 @@ def test_scan_applies_learned_performance_boost(monkeypatch):
     live = asyncio.run(scanner.scan())
     weights = {c.channel: c.weight for c in live}
     assert weights["nico_la"] > weights["byilhan"]
+
+
+def test_tiktok_slots_are_spent_at_good_hours_and_spaced(tmp_path):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    paris = ZoneInfo("Europe/Paris")
+    at = lambda h, m=0: datetime(2026, 9, 28, h, m, tzinfo=paris).timestamp()
+    w = pipeline_mod.seconds_until_window
+    assert w(at(14), "Europe/Paris", "11-23") == 0
+    assert w(at(3), "Europe/Paris", "11-23") == pytest.approx(8 * 3600)      # attend 11h
+    assert w(at(23, 30), "Europe/Paris", "11-23") == pytest.approx(11.5 * 3600)
+    assert w(at(1), "Europe/Paris", "20-2") == 0                             # passe minuit
+    assert w(at(3), "Europe/Paris", "0-24") == 0 and w(at(3), "Europe/Paris", "n'importe") == 0
+
+    s = Settings()
+    s.capture.work_dir = tmp_path
+    s.publish.tiktok_hours, s.publish.tiktok_gap_min = "11-23", 90
+    store = Store(tmp_path / "w.db")
+    p = pipeline_mod.Pipeline(s, store, None, FakeTelegram(), SimpleNamespace(configured=True, connected=True))
+    now = at(15)
+    store.set("tiktok_inbox_log", [now - 30 * 60, now - 25 * 3600])   # le 2e a plus de 24 h
+    assert p.tiktok_wait(now) == pytest.approx(60 * 60, abs=5)          # 90 min après le dernier
+    assert p.tiktok_wait(at(3)) > 7 * 3600                              # la nuit : on garde
+    p.force_until = now + 600                                           # /relance
+    assert p.tiktok_wait(now) == 0
+
+
+def test_overflow_goes_to_manual_lane_with_copyable_caption(tmp_path):
+    import time as _t
+    s = Settings()
+    s.capture.work_dir = tmp_path
+    s.publish.manual_per_day, s.publish.manual_min_score = 2, 7
+    store = Store(tmp_path / "m.db")
+    video = tmp_path / "c.mp4"
+    video.write_bytes(b"x")
+    mk = lambda ai, age=0: store.add_clip(platform="twitch", channel="x", reason="rire", score=6,
+                                          ai_score=ai, final_path=str(video), caption=f"cap{ai}",
+                                          status="approved", created=_t.time() - age)
+    best = [mk(9) for _ in range(5)]
+    extra = [mk(8), mk(8), mk(8)]          # 3 bons en trop, mais 2 places manuelles par jour
+    weak, stale = mk(6), mk(10, age=40 * 3600)
+    tg = FakeTelegram()
+    p = pipeline_mod.Pipeline(s, store, None, tg, SimpleNamespace(configured=True, connected=True))
+
+    p._expire_stale()
+    asyncio.run(p._trim_approved())
+    st = lambda c: store.clip(c)["status"]
+    assert st(stale) == "skipped"                                   # trop vieux
+    assert all(st(c) == "approved" for c in best)                   # 5 places TikTok
+    assert [st(c) for c in extra].count("manual") == 2 and st(weak) == "skipped"
+    assert len(tg.clips) == 2 and "à poster à la main" in tg.clips[0][3]
+    assert [d for _, d in tg.buttons[0]] == [f"done:{tg.clips[-1][0]}", f"rej:{tg.clips[-1][0]}"]
+
+    manual = tg.clips[0][0]
+    assert "Posté" in asyncio.run(p.done(manual))
+    row = store.clip(manual)
+    assert row["status"] == "published" and row["publish_id"] == "manual" and row["published_at"]
+    assert asyncio.run(p.done(manual)) == "Déjà traité"
+
+    # TikTok bloqué : seuls les 2 meilleurs attendent, sans dépasser le quota manuel
+    p.tiktok_full_until = _t.time() + 600
+    asyncio.run(p._trim_approved())
+    assert p.waiting_count() == 2
+
+
+def test_inbox_upload_logs_slot_and_sends_caption_to_paste(tmp_path):
+    s = Settings()
+    s.capture.work_dir = tmp_path
+    store = Store(tmp_path / "i.db")
+    video = tmp_path / "c.mp4"
+    video.write_bytes(b"x")
+    cid = store.add_clip(platform="twitch", channel="kamet0", reason="rire", score=6, ai_score=8,
+                         final_path=str(video), caption="Il craque <3 #kameto", status="publishing")
+
+    class OkTikTok:
+        mode, configured, connected = "inbox", True, True
+        async def publish(self, *a, **k):
+            return "pub_1"
+
+    tg = FakeTelegram()
+    p = pipeline_mod.Pipeline(s, store, None, tg, OkTikTok())
+    asyncio.run(p._publish_everywhere(dict(store.clip(cid)), ["tiktok"]))
+    assert store.clip(cid)["status"] == "published" and len(p.inbox_log()) == 1
+    assert "<code>Il craque &lt;3 #kameto</code>" in tg.messages[-1]
+
+
+def test_telegram_caption_is_copyable_and_old_buttons_are_refused(tmp_path):
+    from clipbot.telegram import TelegramBot, clip_caption
+    cap = clip_caption("#3 · xqc", "Moment <fou> & drôle " + "#tag " * 400)
+    assert cap.count("<code>") == 1 and "&lt;fou&gt; &amp;" in cap
+    assert len(re.sub(r"<[^>]+>", "", cap)) <= 1024
+
+    store = Store(tmp_path / "b.db")
+    cid = store.add_clip(platform="twitch", channel="x", reason="rire", score=6,
+                         status="ready", tg_message_id=10)
+    tg = TelegramBot("t", "code", store, None, owner_id="7")
+    calls, acted = [], []
+    async def fake_call(method, **kw):
+        calls.append((method, kw.get("json", {})))
+        return {}
+    async def approve(c):
+        acted.append(c)
+        return "ok"
+    tg._call, tg.on_approve = fake_call, approve
+    cq = lambda mid: {"callback_query": {"id": "q", "from": {"id": 7}, "data": f"pub:{cid}",
+                                         "message": {"message_id": mid, "chat": {"id": 7}}}}
+    asyncio.run(tg._handle(cq(99)))            # bouton d'un message d'avant redémarrage
+    assert not acted and calls[0][1].get("show_alert")
+    asyncio.run(tg._handle(cq(10)))
+    assert acted == [cid]

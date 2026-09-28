@@ -13,9 +13,11 @@ capture continuent en parallèle, les clips attendent en file dans SQLite.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiohttp
@@ -28,7 +30,7 @@ from .layout import analyze
 from .render import render
 from .storage import Store
 from .subtitles import build_ass
-from .telegram import TelegramBot
+from .telegram import TelegramBot, copyable
 from .tiktok import TikTokClient, TikTokError
 from .youtube import YouTubeClient, YouTubeError
 from .transcribe import transcribe
@@ -38,6 +40,40 @@ log = logging.getLogger(__name__)
 EMOJI = {"rire": "😂", "action": "🔥", "demande_clip": "🎬", "burst": "⚡",
          "clip_viewer": "📎", "top_clip": "🏆"}
 OUTRO_S = 1.8
+TIKTOK_PENDING_MAX = 5      # brouillons en attente acceptés par TikTok sur 24 h glissantes
+DAY = 86400
+
+
+def parse_hours(spec: str) -> tuple[int, int]:
+    """« 11-23 » -> (11, 23) ; « 20-2 » passe minuit ; invalide -> toute la journée."""
+    try:
+        a, b = (int(x) for x in spec.replace("h", "").split("-", 1))
+        if 0 <= a <= 24 and 0 <= b <= 24 and a != b:
+            return a % 24, b % 24 if b != 24 else 24
+    except ValueError:
+        pass
+    return 0, 24
+
+
+def seconds_until_window(now: float, tz: str, spec: str) -> float:
+    """0 si `now` est dans la plage horaire locale, sinon secondes jusqu'à son début."""
+    start, end = parse_hours(spec)
+    if (start, end) == (0, 24):
+        return 0.0
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = None
+    dt = datetime.fromtimestamp(now, zone) if zone else datetime.fromtimestamp(now)
+    h = dt.hour + dt.minute / 60
+    inside = start <= h < end if start < end else (h >= start or h < end)
+    if inside:
+        return 0.0
+    nxt = dt.replace(hour=start, minute=0, second=0, microsecond=0)
+    if nxt <= dt:
+        nxt += timedelta(days=1)
+    return (nxt - dt).total_seconds()
 
 
 class Pipeline:
@@ -57,8 +93,10 @@ class Pipeline:
         self.tiktok_full_until = 0.0
         self._full_notified = False
         self._publish_wake = asyncio.Event()
+        self.force_until = 0.0     # /relance : ignore créneaux et espacement un moment
         telegram.on_approve = self.approve
         telegram.on_reject = self.reject
+        telegram.on_done = self.done
 
     # ------------------------------------------------------------- entrées
     def wake(self) -> None:
@@ -112,18 +150,91 @@ class Pipeline:
         return out
 
     async def approve(self, clip_id: int) -> str:
-        if self.store.claim(clip_id, "ready", "approved"):
+        if self.store.claim(clip_id, "ready", "approved") \
+                or self.store.claim(clip_id, "manual", "approved"):
             self._publish_wake.set()
             targets = self.platforms()
             if not targets:
                 return "Validé ✅ (aucune plateforme connectée : publie depuis la vidéo)"
+            wait = self.tiktok_wait() if targets == ["tiktok"] else 0
+            if wait > 60:
+                return f"En file TikTok ✅ — envoi vers {self._clock(time.time() + wait)}"
             return "Envoi vers " + " + ".join(t.capitalize() for t in targets) + "… 🚀"
         return "Déjà traité"
 
     async def reject(self, clip_id: int) -> str:
-        if self.store.claim(clip_id, "ready", "rejected"):
+        if self.store.claim(clip_id, "ready", "rejected") \
+                or self.store.claim(clip_id, "manual", "rejected"):
             return "Jeté 🗑️"
         return "Déjà traité"
+
+    async def done(self, clip_id: int) -> str:
+        """Posté à la main depuis Telegram : compté comme publié (statistiques, Whop)."""
+        if self.store.claim(clip_id, "manual", "published") \
+                or self.store.claim(clip_id, "ready", "published"):
+            self.store.update_clip(clip_id, publish_id="manual", published_at=time.time())
+            return "Posté ✅ merci !"
+        return "Déjà traité"
+
+    # ----------------------------------------------------- rythme TikTok
+    @property
+    def pub(self):
+        return self.s.publish
+
+    def inbox_log(self) -> list[float]:
+        """Envois dans la boîte TikTok sur les dernières 24 h (sauvegardé : survit aux
+        redémarrages, pour ne pas croire à tort que les 5 places sont libres)."""
+        now = time.time()
+        return sorted(t for t in self.store.get("tiktok_inbox_log", []) if now - t < DAY)
+
+    def _clock(self, t: float) -> str:
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.fromtimestamp(t, ZoneInfo(self.pub.timezone)).strftime("%Hh%M")
+        except Exception:
+            return datetime.fromtimestamp(t).strftime("%Hh%M")
+
+    def tiktok_wait(self, now: float | None = None) -> float:
+        """Secondes avant le prochain envoi TikTok autorisé : place libre chez TikTok,
+        dans la plage horaire choisie, et assez espacé du précédent (chaque notif arrive
+        à un moment où tu peux publier, au lieu de 5 brouillons qui pourrissent la nuit)."""
+        now = now or time.time()
+        waits = [self.tiktok_full_until - now]
+        if now >= self.force_until:
+            log_ = self.inbox_log()
+            if log_:
+                waits.append(log_[-1] + self.pub.tiktok_gap_min * 60 - now)
+            waits.append(seconds_until_window(now, self.pub.timezone, self.pub.tiktok_hours))
+        return max(0.0, *waits)
+
+    def manual_log(self) -> list[float]:
+        now = time.time()
+        return [t for t in self.store.get("manual_log", []) if now - t < DAY]
+
+    def _expire_stale(self) -> None:
+        """Un moment de live vieux de plus de FRESH_HOURS n'est plus publié."""
+        limit = time.time() - self.pub.fresh_hours * 3600
+        for row in self.store.db.execute(
+                "SELECT id FROM clips WHERE status='approved' AND created < ?", (limit,)).fetchall():
+            if self.store.claim(row["id"], "approved", "skipped"):
+                log.info("Clip %s trop ancien, retiré de la file", row["id"])
+
+    def tiktok_status_line(self) -> str:
+        if not (self.tiktok.configured and self.tiktok.connected):
+            return ""
+        used, now = len(self.inbox_log()), time.time()
+        parts = [f"{used}/{TIKTOK_PENDING_MAX} envois sur 24 h"]
+        n = self.waiting_count()
+        if n:
+            wait = self.tiktok_wait(now)
+            parts.append(f"{n} en file · prochain envoi " +
+                         ("maintenant" if wait < 60 else f"~{self._clock(now + wait)}"))
+        if now < self.tiktok_full_until:
+            parts.append("🟡 TikTok plein (brouillons non publiés)")
+        manual = len(self.manual_log())
+        if manual:
+            parts.append(f"📲 {manual} envoyés sur Telegram à poster à la main")
+        return "\n  " + " · ".join(parts)
 
     # ------------------------------------------------------- post-production
     async def run_processor(self) -> None:
@@ -218,6 +329,7 @@ class Pipeline:
     # ------------------------------------------------------------ publication
     async def run_publisher(self) -> None:
         while True:
+            self._expire_stale()
             row = self.store.next_clip("approved")
             if row is None:
                 self._publish_wake.clear()
@@ -235,36 +347,62 @@ class Pipeline:
                     await self.tg.send_clip(cid, Path(row["final_path"]), row["caption"] or "",
                                             f"#{cid} prêt (auto) — aucune plateforme connectée")
                 continue
-            if targets == ["tiktok"] and time.time() < self.tiktok_full_until:
-                # File TikTok pleine : les clips attendent (les meilleurs d'abord)
+            if targets == ["tiktok"]:
+                # 5 places par jour chez TikTok : seuls les meilleurs y attendent, les autres
+                # bons clips partent tout de suite sur Telegram (voie manuelle, illimitée).
                 await self._trim_approved()
-                self._publish_wake.clear()
-                try:
-                    await asyncio.wait_for(self._publish_wake.wait(),
-                                           min(60, self.tiktok_full_until - time.time()))
-                except asyncio.TimeoutError:
-                    pass
-                continue
+                wait = self.tiktok_wait()
+                if wait > 0:
+                    self._publish_wake.clear()
+                    try:
+                        await asyncio.wait_for(self._publish_wake.wait(), min(60, wait))
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                row = self.store.next_clip("approved")
+                if row is None:
+                    continue
+                cid = row["id"]
             if not self.store.claim(cid, "approved", "publishing"):
                 continue
             await self._publish_everywhere(dict(row), targets)
             # Limites TikTok/YouTube : on espace les envois
             await asyncio.sleep(30)
 
-    MAX_WAITING = 8
+    MAX_WAITING = TIKTOK_PENDING_MAX   # une journée de places TikTok, pas plus
 
     async def _trim_approved(self) -> None:
-        """File d'attente TikTok limitée aux 8 meilleurs clips ; les autres reviennent
-        dans Telegram (boutons ✅/❌) pour une publication à la main."""
+        """File TikTok limitée aux meilleurs clips ; les autres passent sur la voie manuelle
+        tant qu'ils sont frais (un moment de live perd sa valeur en quelques heures)."""
         rows = self.store.db.execute(
             "SELECT * FROM clips WHERE status='approved' "
-            "ORDER BY COALESCE(ai_score,0) DESC, score DESC").fetchall()
-        for row in rows[self.MAX_WAITING:]:
-            if self.store.claim(row["id"], "approved", "ready"):
-                mid = await self.tg.send_clip(row["id"], Path(row["final_path"]), row["caption"] or "",
-                                              f"#{row['id']} · file TikTok pleine, à publier à la main")
-                if mid:
-                    self.store.update_clip(row["id"], tg_message_id=mid)
+            "ORDER BY COALESCE(ai_score,0) DESC, score DESC, created DESC").fetchall()
+        # TikTok bloqué (brouillons pas encore publiés) : inutile d'y faire vieillir 5 clips
+        keep = 2 if time.time() < self.tiktok_full_until else self.MAX_WAITING
+        for row in rows[keep:]:
+            await self._to_manual(row)
+
+    async def _to_manual(self, row) -> None:
+        cid = row["id"]
+        ai = row["ai_score"] if row["ai_score"] is not None else self.pub.manual_min_score
+        if ai < self.pub.manual_min_score or len(self.manual_log()) >= self.pub.manual_per_day:
+            if self.store.claim(cid, "approved", "skipped"):
+                log.info("Clip %s écarté (file TikTok pleine, note %s, voie manuelle %d/%d)",
+                         cid, row["ai_score"], len(self.manual_log()), self.pub.manual_per_day)
+            return
+        if not self.store.claim(cid, "approved", "manual"):
+            return
+        header = (f"📲 #{cid} · {row['channel']} · IA {row['ai_score'] if row['ai_score'] is not None else '?'}/10"
+                  " — à poster à la main (les 5 places TikTok du jour sont prises par "
+                  "les meilleurs).\nVidéo : ⋮ → Partager → TikTok, puis colle la légende.")
+        mid = await self.tg.send_clip(cid, Path(row["final_path"]), row["caption"] or "", header,
+                                      buttons=[[("✅ Posté sur TikTok", f"done:{cid}"),
+                                                ("🗑️ Jeter", f"rej:{cid}")]])
+        if mid:
+            self.store.update_clip(cid, tg_message_id=mid)
+            self.store.set("manual_log", self.manual_log() + [time.time()])
+        else:
+            self.store.update_clip(cid, status="skipped", error="envoi Telegram impossible")
 
     def waiting_count(self) -> int:
         return self.store.db.execute(
@@ -281,8 +419,9 @@ class Pipeline:
                     ids[t] = await self.tiktok.publish(path, caption,
                                                        branded=self.s.processing.ad_disclosure)
                     self._full_notified = False
-                    report.append("TikTok : " + ("prêt dans ton app → Notifications système, "
-                                                 "touche la notif puis Publier"
+                    self.store.set("tiktok_inbox_log", self.inbox_log() + [time.time()])
+                    report.append("TikTok : " + ("prêt dans ton app → touche la notification "
+                                                 "« contenu prêt » puis Publier"
                                                  if self.tiktok.mode == "inbox" else "publié ✅"))
                 elif t == "youtube":
                     ids[t] = await self.youtube.publish(path, caption, hook)
@@ -304,15 +443,22 @@ class Pipeline:
             if not self._full_notified:
                 self._full_notified = True
                 await self.tg.send(
-                    "🟡 5 vidéos attendent déjà dans TikTok (limite de TikTok).\n"
-                    "Ouvre TikTok → Messages → Notifications système → « Ton contenu de "
-                    "Joe-clipbot est prêt » → Publier (ou supprimer).\n"
-                    "Je garde les meilleurs clips en file et je les envoie dès qu'il y a de la place.")
+                    "🟡 TikTok refuse : 5 brouillons attendent déjà d'être publiés.\n"
+                    "Supprimer la notification ne libère PAS la place : il faut ouvrir le "
+                    "brouillon et toucher Publier. Sinon TikTok ne rend la place qu'au bout "
+                    "d'environ 24 h après l'envoi.\n"
+                    "En attendant, je garde les 2 meilleurs clips pour TikTok et je t'envoie "
+                    "les autres bons clips ici, prêts à poster à la main.")
             return
         if ids:
             self.store.update_clip(cid, status="published", publish_id=json.dumps(ids),
                                    error=None, published_at=time.time())
-            await self.tg.send(f"Clip #{cid}\n" + "\n".join(report))
+            text = html.escape(f"Clip #{cid} ({row.get('channel') or '?'})\n" + "\n".join(report),
+                               quote=False)
+            if "tiktok" in ids and self.tiktok.mode == "inbox":
+                # Le brouillon TikTok arrive SANS légende (limite de l'API) : à coller.
+                text += "\n\n👇 légende à coller dans TikTok (tap pour copier)\n" + copyable(caption)
+            await self.tg.send(text, html=True)
             return
         # Échec partout (ex. limite de 5 brouillons TikTok atteinte) : le clip n'est pas
         # perdu, il revient dans Telegram avec ses boutons pour réessayer plus tard.

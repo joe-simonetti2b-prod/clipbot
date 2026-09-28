@@ -146,6 +146,17 @@ class PublishConfig:
     youtube_client_secret: str = _env("YOUTUBE_CLIENT_SECRET")
     youtube_privacy: str = _env("YOUTUBE_PRIVACY", "public")
     auto_publish: bool = _env("AUTO_PUBLISH", "false", _bool)
+    # TikTok n'accepte que 5 brouillons en attente par 24 h : on les dépense aux bonnes
+    # heures (heure locale), espacés, pour que chaque notif arrive quand tu peux publier.
+    timezone: str = _env("TIMEZONE", "Europe/Paris")
+    tiktok_hours: str = _env("TIKTOK_HOURS", "11-23")
+    tiktok_gap_min: int = _env("TIKTOK_GAP_MIN", "90", int)
+    # Voie manuelle (illimitée) : les bons clips en plus arrivent sur Telegram, prêts à
+    # partager vers TikTok avec la légende copiable d'un tap.
+    manual_per_day: int = _env("MANUAL_PER_DAY", "10", int)
+    manual_min_score: int = _env("MANUAL_MIN_SCORE", "7", int)
+    # Au-delà, un moment de live n'intéresse plus personne : pas publié.
+    fresh_hours: float = _env("FRESH_HOURS", "30", float)
     # Statistiques du compte + liste des vidéos (missions TikTok, lien auto pour Whop).
     # Si l'app ne les a pas activées dans le portail développeur, la connexion le dit et
     # les coupe elle-même : pas besoin d'y toucher à la main dans ce cas.

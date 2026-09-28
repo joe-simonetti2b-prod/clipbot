@@ -93,10 +93,10 @@ class Store:
     def next_clip(self, status: str, avoid_channel: str | None = None) -> sqlite3.Row | None:
         """Meilleur clip en attente ; si possible d'un autre créateur que `avoid_channel`
         (alternance : chaque créateur suivi a ses clips)."""
-        if status == "approved":   # à publier : d'abord les mieux notés par l'IA
+        if status == "approved":   # à publier : d'abord les mieux notés, puis les plus frais
             return self.db.execute(
                 "SELECT * FROM clips WHERE status='approved' "
-                "ORDER BY COALESCE(ai_score, 0) DESC, score DESC, created LIMIT 1").fetchone()
+                "ORDER BY COALESCE(ai_score, 0) DESC, score DESC, created DESC LIMIT 1").fetchone()
         return self.db.execute(
             "SELECT * FROM clips WHERE status=? ORDER BY (channel IS ? ) ASC, score DESC, created "
             "LIMIT 1", (status, avoid_channel)
@@ -125,7 +125,7 @@ class Store:
     def expired(self, before: float) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT * FROM clips WHERE created<? AND status IN "
-            "('published','rejected','discarded','failed') "
+            "('published','rejected','discarded','failed','skipped','manual') "
             "AND (raw_path IS NOT NULL OR final_path IS NOT NULL)",
             (before,),
         ).fetchall()

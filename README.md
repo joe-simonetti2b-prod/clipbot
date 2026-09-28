@@ -124,12 +124,23 @@ Ajoute les produits **Login Kit** et **Content Posting API**. Renseigne :
 - Privacy Policy URL : `https://<ton-domaine>/privacy`
 
 Soumets l'app, puis tape `/tiktok` dans Telegram une fois qu'elle est validée.
-- Avant l'audit TikTok (`TIKTOK_MODE=inbox`) : les clips arrivent en brouillon
-  dans ton app TikTok, tu touches *Publier*. Limite : 5 brouillons par jour.
-- Après l'audit (`TIKTOK_MODE=direct`) : publication publique 100 % automatique.
+- `TIKTOK_MODE=inbox` : les clips arrivent en brouillon dans ton app TikTok, tu
+  touches *Publier*. Limite TikTok : 5 brouillons non publiés sur 24 h glissantes
+  (supprimer la notification ne libère pas la place). Le brouillon arrive sans
+  légende : le bot t'envoie la légende sur Telegram, un tap pour la copier.
+- Le mode `direct` exige l'audit TikTok, et les règles TikTok refusent
+  explicitement les apps qui recopient du contenu d'autres plateformes, et
+  imposent ta confirmation à chaque publication : ne pas compter dessus.
 
-Tant que TikTok n'est pas branché, publie depuis Telegram : ouvre la vidéo →
-⋮ → *Enregistrer dans la galerie* → TikTok. La légende est dans le message.
+### Deux voies de publication
+1. **Voie TikTok (auto)** : les 5 places du jour sont dépensées sur les meilleurs
+   clips, dans la plage `TIKTOK_HOURS` (11-23 h par défaut, heure de `TIMEZONE`),
+   espacées de `TIKTOK_GAP_MIN` minutes : chaque notif arrive quand tu peux publier.
+   `/relance` ignore créneau et espacement pendant 20 min.
+2. **Voie manuelle (illimitée)** : les autres bons clips (note IA ≥ `MANUAL_MIN_SCORE`,
+   `MANUAL_PER_DAY` par jour) arrivent aussitôt sur Telegram, légende copiable d'un
+   tap. Vidéo → ⋮ → *Partager* → TikTok, colle la légende, puis *✅ Posté sur TikTok*.
+Un clip de plus de `FRESH_HOURS` heures n'est plus publié.
 
 ## Rentabilité : réglages clés (v2)
 

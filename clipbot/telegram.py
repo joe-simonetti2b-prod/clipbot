@@ -52,15 +52,38 @@ def clip_caption(header: str, caption: str) -> str:
             f"{copyable(caption, max(room, 100))}")
 
 
+OWNER_MENU = [
+    ("status", "État du bot"), ("auto", "on/off publication auto"),
+    ("pause", "Mettre en pause"), ("resume", "Reprendre"),
+    ("add", "Suivre une chaîne"), ("remove", "Ne plus suivre"),
+    ("chaines", "Chaînes suivies"), ("tiktok", "Connecter TikTok"),
+    ("youtube", "Connecter YouTube Shorts"),
+    ("relance", "Renvoyer la file vers TikTok"),
+    ("lives", "Choisir les lives suivis"), ("algo", "Lives choisis par l'algorithme"),
+    ("tag", "Tag incrusté sur les vidéos"), ("outro", "on/off fin avec S'abonner"),
+    ("whop", "Campagnes Whop suivies"), ("boutique", "Ventes aux clients"),
+]
+
+
 class TelegramBot:
     def __init__(self, token: str, pair_code: str, store: Store, session: aiohttp.ClientSession,
-                 owner_id: str = ""):
+                 owner_id: str = "", public_only: bool = False, offset_key: str = "telegram_offset"):
         self.api = f"https://api.telegram.org/bot{token}"
+        self.token = token
         self.enabled = bool(token)
         self.pair_code = pair_code
         self.owner_id = int(owner_id) if owner_id.strip().lstrip("-").isdigit() else None
         self.store = store
         self.session = session
+        # Bot « boutique » dédié : aucune commande de pilotage, tout va aux clients
+        self.public_only = public_only
+        self.offset_key = offset_key
+        # Messages / boutons / paiements de quelqu'un d'autre que toi -> boutique
+        self.public: Callable[[dict], Awaitable[None]] | None = None
+        self.on_owner_link: Callable[[str], Awaitable[str]] | None = None
+        self.menu: list[tuple[str, str]] = OWNER_MENU
+        self.public_menu: list[tuple[str, str]] = []
+        self.username = ""
         self.commands: dict[str, Handler] = {}
         self.on_approve: Callable[[int], Awaitable[str]] | None = None
         self.on_reject: Callable[[int], Awaitable[str]] | None = None
@@ -104,6 +127,39 @@ class TelegramBot:
         except Exception as e:
             log.warning("Envoi Telegram impossible : %s", e)
 
+    async def reply(self, chat_id: int, text: str, rows: list | None = None,
+                    html: bool = False) -> int | None:
+        """Message à n'importe quelle conversation (clients, groupes), boutons facultatifs."""
+        body = {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True}
+        if rows:
+            body["reply_markup"] = {"inline_keyboard": _keyboard(rows)}
+        if html:
+            body["parse_mode"] = "HTML"
+        try:
+            return (await self._call("sendMessage", json=body))["message_id"]
+        except Exception as e:
+            log.warning("Envoi Telegram vers %s impossible : %s", chat_id, e)
+            return None
+
+    async def send_video(self, chat_id: int, path: Path, caption_html: str,
+                         rows: list | None = None) -> int | None:
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        form.add_field("caption", caption_html)
+        form.add_field("parse_mode", "HTML")
+        form.add_field("supports_streaming", "true")
+        if rows:
+            form.add_field("reply_markup", json.dumps({"inline_keyboard": _keyboard(rows)}))
+        try:
+            with path.open("rb") as f:
+                form.add_field("video", f, filename=path.name, content_type="video/mp4")
+                msg = await self._call("sendVideo", data=form,
+                                       timeout=aiohttp.ClientTimeout(total=300))
+            return msg["message_id"]
+        except Exception as e:
+            log.error("Envoi de la vidéo %s vers %s impossible : %s", path.name, chat_id, e)
+            return None
+
     async def send_clip(self, clip_id: int, path: Path, caption: str, header: str,
                         buttons: list[list[tuple[str, str]]] | None = None) -> int | None:
         if not (self.enabled and self.owner):
@@ -133,19 +189,19 @@ class TelegramBot:
         if not self.enabled:
             log.warning("TELEGRAM_BOT_TOKEN absent : pas de télécommande.")
             return
-        await self._call("setMyCommands", json={"commands": [
-            {"command": c, "description": d} for c, d in [
-                ("status", "État du bot"), ("auto", "on/off publication auto"),
-                ("pause", "Mettre en pause"), ("resume", "Reprendre"),
-                ("add", "Suivre une chaîne"), ("remove", "Ne plus suivre"),
-                ("chaines", "Chaînes suivies"), ("tiktok", "Connecter TikTok"),
-                ("youtube", "Connecter YouTube Shorts"),
-                ("relance", "Renvoyer la file vers TikTok"),
-                ("lives", "Choisir les lives suivis"), ("algo", "Lives choisis par l'algorithme"),
-                ("tag", "Tag incrusté sur les vidéos"), ("outro", "on/off fin avec S'abonner"),
-                ("whop", "Campagnes Whop suivies"),
-            ]]})
-        offset = self.store.get("telegram_offset", 0)
+        try:
+            self.username = (await self._call("getMe"))["username"]
+        except Exception as e:
+            log.warning("Telegram getMe : %s", e)
+        cmds = lambda menu: [{"command": c, "description": d} for c, d in menu]
+        if self.public_menu and self.owner and not self.public_only:
+            # Même bot pour toi et les clients : chacun voit son propre menu
+            await self._call("setMyCommands", json={"commands": cmds(self.public_menu)})
+            await self._call("setMyCommands", json={
+                "commands": cmds(self.menu), "scope": {"type": "chat", "chat_id": self.owner}})
+        else:
+            await self._call("setMyCommands", json={"commands": cmds(self.menu)})
+        offset = self.store.get(self.offset_key, 0)
         while True:
             try:
                 updates = await self._call(
@@ -164,13 +220,19 @@ class TelegramBot:
                     await self._handle(u)
                 except Exception as e:
                     log.exception("Erreur de traitement Telegram : %s", e)
-            self.store.set("telegram_offset", offset)
+            self.store.set(self.offset_key, offset)
+
+    async def _public(self, u: dict) -> None:
+        if self.public:
+            await self.public(u)
 
     async def _handle(self, u: dict) -> None:
+        if self.public_only or "pre_checkout_query" in u:
+            return await self._public(u)
         if "callback_query" in u:
             cq = u["callback_query"]
-            if cq["from"]["id"] != self.owner:
-                return
+            if cq["from"]["id"] != self.owner or cq.get("data", "").startswith("shop"):
+                return await self._public(u)
             action, _, cid = cq.get("data", "").partition(":")
             if action in self.callbacks:
                 text, rows = await self.callbacks[action](cid)
@@ -210,7 +272,24 @@ class TelegramBot:
         msg = u.get("message") or {}
         text = (msg.get("text") or "").strip()
         chat_id = msg.get("chat", {}).get("id")
-        if not text.startswith("/") or not chat_id:
+        if not chat_id:
+            return
+        if msg.get("successful_payment"):
+            return await self._public(u)
+        if chat_id != self.owner and self.owner is not None:
+            parts = text.split()
+            if parts and parts[0].split("@")[0].lower() == "/start" and len(parts) > 1 \
+                    and self.pair_code and parts[1] == self.pair_code:
+                log.warning("Tentative d'appairage refusée (chat %s) : bot déjà appairé", chat_id)
+                await self.send(f"⚠️ Quelqu'un a tenté d'appairer ton bot (id {chat_id}). Refusé.")
+                return
+            return await self._public(u)   # clients (boutique) ; ignoré si elle est fermée
+        if not text.startswith("/"):
+            # Lien de clip envoyé par toi : monté pour ton compte
+            if chat_id == self.owner and self.on_owner_link and ("twitch.tv" in text or "kick.com" in text):
+                reply = await self.on_owner_link(text)
+                if reply:
+                    await self.send(reply, chat_id)
             return
         cmd, *args = text.split()
         cmd = cmd[1:].split("@")[0].lower()
@@ -218,9 +297,6 @@ class TelegramBot:
         if cmd == "start":
             if self.owner == chat_id:
                 await self.send("Déjà appairé ✅ — /status pour voir l'état.", chat_id)
-            elif self.owner is not None:
-                log.warning("Tentative d'appairage refusée (chat %s) : bot déjà appairé", chat_id)
-                await self.send(f"⚠️ Quelqu'un a tenté d'appairer ton bot (id {chat_id}). Refusé.")
             elif self.pair_code and args and args[0] == self.pair_code:
                 self.store.set("telegram_owner", chat_id)
                 await self.send("Appairage réussi ✅\nTu recevras ici chaque clip à valider.\n"

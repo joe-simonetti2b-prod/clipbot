@@ -54,6 +54,10 @@ class Store:
             self.db.execute("ALTER TABLE clips ADD COLUMN tiktok_video_id TEXT")
             self.db.execute("ALTER TABLE clips ADD COLUMN tiktok_url TEXT")
             self.db.execute("ALTER TABLE clips ADD COLUMN tiktok_views INTEGER")
+        if "customer_id" not in cols:   # boutique : clip commandé par un client
+            for col in ("customer_id INTEGER", "customer_chat INTEGER", "customer_tag TEXT",
+                        "customer_lang TEXT", "customer_job TEXT"):
+                self.db.execute(f"ALTER TABLE clips ADD COLUMN {col}")
         # Au redémarrage, un clip resté « en cours » est remis dans la file.
         self.db.execute("UPDATE clips SET status='extracted' WHERE status='processing'")
         self.db.execute("UPDATE clips SET status='approved' WHERE status='publishing'")
@@ -90,16 +94,18 @@ class Store:
     def clip(self, clip_id: int) -> sqlite3.Row | None:
         return self.db.execute("SELECT * FROM clips WHERE id=?", (clip_id,)).fetchone()
 
-    def next_clip(self, status: str, avoid_channel: str | None = None) -> sqlite3.Row | None:
+    def next_clip(self, status: str, avoid_channel: str | None = None,
+                  own_only: bool = False) -> sqlite3.Row | None:
         """Meilleur clip en attente ; si possible d'un autre créateur que `avoid_channel`
-        (alternance : chaque créateur suivi a ses clips)."""
+        (alternance : chaque créateur suivi a ses clips). `own_only` : hors commandes clients."""
         if status == "approved":   # à publier : d'abord les mieux notés, puis les plus frais
             return self.db.execute(
-                "SELECT * FROM clips WHERE status='approved' "
+                "SELECT * FROM clips WHERE status='approved' AND customer_id IS NULL "
                 "ORDER BY COALESCE(ai_score, 0) DESC, score DESC, created DESC LIMIT 1").fetchone()
+        own = "AND customer_id IS NULL " if own_only else ""
         return self.db.execute(
-            "SELECT * FROM clips WHERE status=? ORDER BY (channel IS ? ) ASC, score DESC, created "
-            "LIMIT 1", (status, avoid_channel)
+            f"SELECT * FROM clips WHERE status=? {own}ORDER BY (channel IS ? ) ASC, score DESC, "
+            "created LIMIT 1", (status, avoid_channel)
         ).fetchone()
 
     def overflow(self, status: str, keep: int) -> list[sqlite3.Row]:
@@ -118,14 +124,15 @@ class Store:
 
     def counts_since(self, since: float) -> dict[str, int]:
         rows = self.db.execute(
-            "SELECT status, COUNT(*) n FROM clips WHERE created>=? GROUP BY status", (since,)
+            "SELECT status, COUNT(*) n FROM clips WHERE created>=? AND customer_id IS NULL "
+            "GROUP BY status", (since,)
         ).fetchall()
         return {r["status"]: r["n"] for r in rows}
 
     def expired(self, before: float) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT * FROM clips WHERE created<? AND status IN "
-            "('published','rejected','discarded','failed','skipped','manual') "
+            "('published','rejected','discarded','failed','skipped','manual','delivered') "
             "AND (raw_path IS NOT NULL OR final_path IS NOT NULL)",
             (before,),
         ).fetchall()

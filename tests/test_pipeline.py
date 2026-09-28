@@ -481,19 +481,32 @@ def test_telegram_backup_roundtrip(tmp_path):
     assert unseal(seal({"a": 1}, "tok"), "tok") == {"a": 1}
     assert unseal(seal({"a": 1}, "tok"), "autre") is None       # illisible sans le bon jeton
 
+    def blob_of(form):
+        return next(v for _, _, v in form._fields if isinstance(v, bytes))
+
+    class Resp:
+        def __init__(self, data): self.data = data
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def read(self): return self.data
+
     class FakeBot:
         enabled, owner = True, 42
         def __init__(self):
-            self.pinned, self.calls = None, []
+            self.pinned, self.calls, self.file = None, [], b""
+            self.session = SimpleNamespace(get=lambda url: Resp(self.file))
         async def _call(self, method, **kw):
             self.calls.append(method)
-            body = kw.get("json", {})
-            if method == "sendMessage":
-                self.pinned = {"message_id": 7, "text": body["text"]}
+            if method == "sendDocument":
+                self.file = blob_of(kw["data"])
+                self.pinned = {"message_id": 7, "caption": HEADER.strip(),
+                               "document": {"file_id": "F"}}
                 return {"message_id": 7}
-            if method == "editMessageText":
-                self.pinned["text"] = body["text"]
+            if method == "editMessageMedia":
+                self.file = blob_of(kw["data"])
                 return {}
+            if method == "getFile":
+                return {"file_path": "doc/x.txt"}
             if method == "getChat":
                 return {"pinned_message": self.pinned} if self.pinned else {}
             return {}
@@ -503,16 +516,24 @@ def test_telegram_backup_roundtrip(tmp_path):
     b1 = TelegramBackup(bot, first, "jeton")
     first.set("tiktok_tokens", {"refresh_token": "r"})
     first.set("auto_publish", True)
+    first.set("shop_customers", {str(i): {"credits": i} for i in range(400)})  # > 4096 car.
     asyncio.run(b1._write())
-    assert bot.pinned["text"].startswith(HEADER) and "refresh" not in bot.pinned["text"]
+    assert bot.file and b"refresh" not in bot.file              # chiffré
 
     fresh = Store(tmp_path / "b.db")                            # redémarrage : disque vide
     b2 = TelegramBackup(bot, fresh, "jeton")
-    assert asyncio.run(b2.restore()) == 2
+    assert asyncio.run(b2.restore()) == 3
     assert fresh.get("tiktok_tokens") == {"refresh_token": "r"} and fresh.get("auto_publish") is True
+    assert fresh.get("shop_customers")["399"] == {"credits": 399}
     fresh.set("paused", True)
     asyncio.run(b2._write())
-    assert bot.calls.count("sendMessage") == 1 and "editMessageText" in bot.calls
+    assert bot.calls.count("sendDocument") == 1 and "editMessageMedia" in bot.calls
+
+    # Ancien format (texte épinglé) toujours relu après la mise à jour
+    bot.pinned = {"message_id": 3, "text": HEADER + seal({"auto_publish": False}, "jeton")}
+    old = Store(tmp_path / "c.db")
+    assert asyncio.run(TelegramBackup(bot, old, "jeton").restore()) == 1
+    assert old.get("auto_publish") is False
 
 
 # ------------------------------------------------------ v3 : Twitch + Kick, 2 lives
@@ -891,14 +912,18 @@ def test_render_outro_and_av_sync(tmp_path):
 
 
 # ---------------------------------------------------------------- v4 : missions & Whop
-def test_harvest_rejects_disallowed_host():
-    from clipbot.harvest import ClipHarvester
-    import tempfile
-    h = ClipHarvester.__new__(ClipHarvester)  # pas besoin d'un store réel pour ce test
+def test_harvest_rejects_disallowed_host(tmp_path):
+    from clipbot.harvest import ClipHarvester, download_clip
     from clipbot.models import StreamCandidate
+    # Téléchargeur commun (chat, top clips, toi, clients) : l'hôte est vérifié avant yt-dlp
+    with pytest.raises(RuntimeError, match="hôte non autorisé"):
+        asyncio.run(download_clip("https://evil.com/clips.twitch.tv/x", tmp_path))
+    h = ClipHarvester.__new__(ClipHarvester)
+    h.dir, h.res = tmp_path, None
     c = StreamCandidate(Platform.TWITCH, "x", "1", "https://x", "", "", 1)
     with pytest.raises(RuntimeError, match="hôte non autorisé"):
         asyncio.run(h._fetch(c, "https://evil.com/clips.twitch.tv/x", "posté", 0))
+    assert not list(tmp_path.iterdir())
 
 
 def test_analytics_matching_and_rewards_milestones(tmp_path):
@@ -1137,3 +1162,271 @@ def test_telegram_caption_is_copyable_and_old_buttons_are_refused(tmp_path):
     assert not acted and calls[0][1].get("show_alert")
     asyncio.run(tg._handle(cq(10)))
     assert acted == [cid]
+
+
+# ------------------------------------------------------ boutique (vente de clips)
+class FakeShopBot:
+    username = "clipshop_bot"
+
+    def __init__(self):
+        self.replies, self.videos, self.calls, self.owner_msgs = [], [], [], []
+
+    async def reply(self, chat_id, text, rows=None, html=False):
+        self.replies.append((chat_id, text, rows))
+        return 1
+
+    async def send_video(self, chat_id, path, caption, rows=None):
+        self.videos.append((chat_id, path, caption))
+        return 5
+
+    async def send(self, text, chat_id=None, html=False):
+        self.owner_msgs.append(text)
+
+    async def _call(self, method, **kw):
+        self.calls.append((method, kw.get("json", {})))
+        return {}
+
+
+def _shop(tmp_path, monkeypatch, **cfg):
+    from clipbot import shop as shop_mod
+    s = Settings()
+    s.capture.work_dir = tmp_path
+    for k, v in cfg.items():
+        setattr(s.shop, k, v)
+    store = Store(tmp_path / "shop.db")
+    bot = FakeShopBot()
+    woke = []
+    sh = shop_mod.Shop(s, store, bot, bot, None, None, wake=lambda: woke.append(1))
+
+    async def fake_download(url, dest, res=None):
+        dest.mkdir(parents=True, exist_ok=True)
+        f = dest / "c.mp4"
+        f.write_bytes(b"x")
+        return f, {"channel": "Kamet0", "title": "gros moment"}, 42.0
+    monkeypatch.setattr(shop_mod, "download_clip", fake_download)
+    return sh, store, bot, woke
+
+
+def _msg(uid, text, chat=None, ctype="private"):
+    return {"message": {"chat": {"id": chat or uid, "type": ctype},
+                        "from": {"id": uid, "username": f"u{uid}"}, "text": text}}
+
+
+def test_shop_order_priority_delivery_and_credits(tmp_path, monkeypatch):
+    import time as _t
+    sh, store, bot, woke = _shop(tmp_path, monkeypatch, free_trial=1)
+
+    async def scenario():
+        await sh.handle(_msg(7, "/start"))
+        assert sh.customer(7)["credits"] == 1 and "offert" in bot.replies[-1][1]
+        await sh.handle(_msg(7, "https://evil.com/clip/x"))
+        assert "non pris en charge" in bot.replies[-1][1]
+        await sh.handle(_msg(7, "/tag moncompte"))
+        await sh.handle(_msg(7, "regarde https://clips.twitch.tv/SuperClipAbc"))
+        await asyncio.gather(*sh._tasks)
+        assert woke and sh.pending(7) == 1 and sh.available(7) == 0
+        await sh.handle(_msg(7, "https://clips.twitch.tv/Autre"))          # plus de crédit
+        assert "Plus de crédit" in bot.replies[-1][1] and bot.replies[-1][2]
+        row = store.db.execute("SELECT * FROM clips WHERE customer_id=7").fetchone()
+        assert row["customer_tag"] == "@moncompte" and row["channel"] == "kamet0"
+        return dict(row)
+    row = asyncio.run(scenario())
+
+    # Priorité : notre propre clip passe avant la commande… sauf si elle attend trop
+    p = pipeline_mod.Pipeline(Settings(), store, None, FakeTelegram(), SimpleNamespace())
+    own = store.add_clip(platform="twitch", channel="x", reason="rire", score=5, raw_path="r")
+    assert p.next_job()["id"] == own
+    store.update_clip(row["id"], created=_t.time() - 3600)
+    assert p.next_job()["id"] == row["id"]
+    p.trim_backlog()
+    assert store.clip(row["id"])["status"] == "extracted"       # jamais écartée
+
+    # Livraison : vidéo envoyée, 1 crédit débité, commande terminée
+    out = tmp_path / "final.mp4"
+    out.write_bytes(b"v")
+    store.update_clip(row["id"], caption="Il craque #kameto")
+    asyncio.run(sh.deliver(dict(store.clip(row["id"])), out, SimpleNamespace(hook="Il craque")))
+    assert bot.videos and "<code>Il craque #kameto</code>" in bot.videos[0][2]
+    assert sh.customer(7)["credits"] == 0 and sh.customer(7)["clips"] == 1 and sh.pending() == 0
+    assert store.clip(row["id"])["status"] == "delivered" and not out.exists()
+
+
+def test_shop_failure_costs_nothing_and_group_needs_command(tmp_path, monkeypatch):
+    sh, store, bot, _ = _shop(tmp_path, monkeypatch, free_trial=2)
+
+    async def scenario():
+        await sh.handle(_msg(8, "https://clips.twitch.tv/Abc", chat=-100, ctype="group"))
+        assert not bot.replies                                       # groupe : sans /clip, rien
+        await sh.handle(_msg(8, "/clip@clipshop_bot https://clips.twitch.tv/Abc", chat=-100,
+                             ctype="group"))
+        await asyncio.gather(*sh._tasks)
+        row = dict(store.db.execute("SELECT * FROM clips WHERE customer_id=8").fetchone())
+        assert row["customer_chat"] == -100
+        await sh.failed(row, "ffmpeg")
+        assert sh.customer(8)["credits"] == 2 and sh.pending() == 0
+        assert "Aucun crédit utilisé" in bot.replies[-1][1]
+    asyncio.run(scenario())
+
+
+def test_shop_stars_payment_is_validated_credited_once_and_refundable(tmp_path, monkeypatch):
+    sh, store, bot, _ = _shop(tmp_path, monkeypatch, free_trial=0, packs="10:450:6")
+
+    async def scenario():
+        await sh.handle({"callback_query": {"id": "q", "from": {"id": 9}, "data": "shop:buy:p0",
+                                            "message": {"chat": {"id": 9}}}})
+        inv = next(b for m, b in bot.calls if m == "sendInvoice")
+        assert inv["currency"] == "XTR" and inv["prices"][0]["amount"] == 450
+        pcq = lambda amount: {"pre_checkout_query": {"id": "c", "from": {"id": 9}, "currency": "XTR",
+                                                     "total_amount": amount, "invoice_payload": "pack:p0"}}
+        await sh.handle(pcq(1))                                      # montant trafiqué
+        await sh.handle(pcq(450))
+        answers = [b["ok"] for m, b in bot.calls if m == "answerPreCheckoutQuery"]
+        assert answers == [False, True]
+        paid = {"message": {"chat": {"id": 9}, "from": {"id": 9, "username": "bob"},
+                            "successful_payment": {"currency": "XTR", "total_amount": 450,
+                                                   "invoice_payload": "pack:p0",
+                                                   "telegram_payment_charge_id": "ch_1"}}}
+        await sh.handle(paid)
+        await sh.handle(paid)                                        # doublon ignoré
+        assert sh.customer(9)["credits"] == 10 and any("Vente" in m for m in bot.owner_msgs)
+        assert "↩️" in await sh.refund(9, "ch_1")
+        assert ("refundStarPayment", {"user_id": 9, "telegram_payment_charge_id": "ch_1"}) in bot.calls
+        assert sh.customer(9)["credits"] == 0 and await sh.refund(9, "ch_1") == "Déjà remboursé."
+    asyncio.run(scenario())
+
+
+def test_shop_crypto_code_is_verified_and_single_use(tmp_path, monkeypatch):
+    sh, store, bot, _ = _shop(tmp_path, monkeypatch, free_trial=0, packs="3:150:2",
+                              cryptopay_token="tok")
+    status = {"v": "active"}
+
+    async def fake_cp(method, **params):
+        if method == "createInvoice":
+            assert params["currency_type"] == "fiat" and params["amount"] == "2.00"
+            assert params["paid_btn_url"].startswith("https://t.me/clipshop_bot?start=r_")
+            return {"invoice_id": 55, "web_app_invoice_url": "https://pay/55"}
+        return {"items": [{"invoice_id": 55, "status": status["v"]}]}
+    sh._cryptopay = fake_cp
+
+    async def scenario():
+        assert await sh.crypto_invoice("p0") == "https://pay/55"
+        code = next(iter(store.get("shop_codes")))
+        await sh.handle(_msg(3, f"/start r_{code}"))
+        assert "pas encore reçu" in bot.replies[-1][1] and sh.customer(3)["credits"] == 0
+        status["v"] = "paid"
+        await sh.handle(_msg(3, f"/start r_{code}"))
+        assert sh.customer(3)["credits"] == 3
+        await sh.handle(_msg(4, f"/start r_{code}"))                 # lien partagé : refusé
+        assert "déjà été utilisé" in bot.replies[-1][1] and sh.customer(4)["credits"] == 0
+    asyncio.run(scenario())
+
+
+def test_telegram_routes_strangers_to_shop_never_to_owner_commands(tmp_path):
+    from clipbot.telegram import TelegramBot
+    store = Store(tmp_path / "r.db")
+    bot = TelegramBot("", "1234", store, None, owner_id="111")
+    public, ran, sent = [], [], []
+    async def pub(u): public.append(u)
+    async def status(args):
+        ran.append(args)
+        return "ok"
+    async def fake_send(text, chat_id=None, html=False): sent.append(text)
+    bot.public, bot.commands["status"], bot.send = pub, status, fake_send
+
+    async def scenario():
+        await bot._handle(_msg(999, "/status"))                       # inconnu : jamais obéi
+        await bot._handle(_msg(999, "/start 1234"))                   # tentative d'appairage
+        await bot._handle(_msg(111, "/status"))
+        await bot._handle({"pre_checkout_query": {"id": "x"}})
+    asyncio.run(scenario())
+    assert len(ran) == 1 and len(public) == 2 and any("Refusé" in t for t in sent)
+
+
+def test_memory_guard_sheds_a_live_and_rotation_shrinks(tmp_path):
+    from clipbot.resources import Resources
+    from clipbot.watcher import plan_rotation
+    used = {"v": 500 * 2**20}
+    res = Resources(512, reader=lambda: used["v"])
+    res.limit = 512 * 2**20
+    shed = []
+    res.on_pressure = lambda: shed.append(1)
+
+    async def scenario():
+        import clipbot.resources as r
+        t0 = r.time.time
+        clock = {"t": t0()}
+        r.time.time = lambda: clock["t"]
+        try:
+            async def advance():
+                while True:
+                    clock["t"] += 30
+                    await asyncio.sleep(0)
+            adv = asyncio.create_task(advance())
+            await res.wait_room(200, max_wait_s=120, poll_s=0)
+            adv.cancel()
+        finally:
+            r.time.time = t0
+    asyncio.run(scenario())
+    assert shed == [1]
+    used["v"] = 100 * 2**20
+    asyncio.run(res.wait_room(200, poll_s=0))                         # place libre : immédiat
+
+    a, b = _cand("a", 5000), _cand("b", 9000)
+    watched = {a.key: (a, 0.0), b.key: (b, 0.0)}
+    stop, start = plan_rotation(watched, [a, b], 1, 1.5, 0, 1e9, pinned={"a", "b"})
+    assert stop == [a.key] and not start                              # le plus faible cède
+
+
+def test_offer_page_lists_packs(tmp_path, monkeypatch):
+    sh, *_ = _shop(tmp_path, monkeypatch, packs="3:150:2,10:450:6")
+    s = Settings()
+    fake = SimpleNamespace(s=s, orch=SimpleNamespace(paused=False, watchers={}),
+                           tiktok=SimpleNamespace(configured=False), tg=FakeTelegram(),
+                           shop=sh, shop_bot=sh.bot)
+
+    async def scenario():
+        async with TestClient(TestServer(build_app(fake))) as c:
+            page = await (await c.get("/offre")).text()
+            assert "450 ⭐" in page and "t.me/clipshop_bot" in page and "crypto" not in page.lower()
+            assert (await c.post("/offre/crypto/p0")).status == 404       # crypto non configurée
+    asyncio.run(scenario())
+
+
+def test_customer_clip_is_rendered_with_their_tag_and_delivered(tmp_path, source_video, monkeypatch):
+    async def fake_transcribe(*a, **k):
+        return Transcript(WORDS, "fr")
+    monkeypatch.setattr(pipeline_mod, "transcribe", fake_transcribe)
+    captured = {}
+    real_ass = pipeline_mod.build_ass
+    def spy_ass(*a, **k):
+        captured.update(k)
+        return real_ass(*a, **k)
+    monkeypatch.setattr(pipeline_mod, "build_ass", spy_ass)
+
+    s = Settings()
+    s.capture.work_dir = tmp_path
+    s.processing.anthropic_api_key = s.processing.groq_api_key = ""
+    s.processing.min_ai_score = 11               # un clip à nous serait jeté ; pas une commande
+    s.processing.cta_text = "Abonne-toi à NOTRE compte"
+    store = Store(tmp_path / "cc.db")
+    raw = tmp_path / "raw.ts"
+    raw.write_bytes(source_video.read_bytes())
+    cid = store.add_clip(platform="twitch", channel="kamet0", reason="commande", score=0,
+                         raw_path=str(raw), trim_offset=1.0, trim_duration=6.0, customer_id=7,
+                         customer_chat=7, customer_tag="@client", customer_lang="original",
+                         customer_job="j1")
+    delivered = []
+
+    async def scenario():
+        async with aiohttp.ClientSession() as session:
+            tg = FakeTelegram()
+            p = pipeline_mod.Pipeline(s, store, session, tg, TikTokClient("", "", "inbox", "", store, session))
+            async def done(row, path, copy):
+                delivered.append((row, path))
+            p.on_customer_done = done
+            await p._process(dict(store.clip(cid)))
+            assert not tg.clips                       # jamais dans notre file / Telegram
+    asyncio.run(scenario())
+    row, path = delivered[0]
+    assert row["status"] == "delivering" and path.exists()
+    assert captured["watermark"] == "@client" and "NOTRE compte" not in (row["caption"] or "")

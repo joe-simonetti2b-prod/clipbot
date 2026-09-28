@@ -153,6 +153,12 @@ def plan_rotation(watched: dict[str, tuple[StreamCandidate, float]],
         creators.discard(kept[weakest][0].channel.lower())
         del kept[weakest]
         stop.append(weakest)
+    # Moins de places qu'avant (mémoire sous pression) : même un choix manuel cède
+    while len(kept) + len(forced) > limit and kept:
+        weakest = min(kept, key=lambda k: kept[k][0].weight)
+        creators.discard(kept[weakest][0].channel.lower())
+        del kept[weakest]
+        stop.append(weakest)
     start += forced
     taken = creators | {c.channel.lower() for c in forced}
 
@@ -198,6 +204,7 @@ class Orchestrator:
         self._rescan = asyncio.Event()
         self.last_live: list[StreamCandidate] = []   # dernier résultat de la veille (/lives)
         self.on_link: Callable[[StreamCandidate, str, str], None] = lambda c, url, who: None
+        self.capacity: Callable[[], int] = lambda: settings.discovery.max_concurrent_streams
 
     def pinned(self) -> set[str]:
         from .discovery import parse_spec
@@ -255,7 +262,9 @@ class Orchestrator:
         self.last_live = live
         watched = {k: (w.c, w.started_at) for k, w in self.watchers.items()}
         d = self.s.discovery
-        stop, start = plan_rotation(watched, live, d.max_concurrent_streams,
+        # Mémoire sous pression (voir resources.py) : un live de moins temporairement
+        slots = max(1, min(d.max_concurrent_streams, self.capacity()))
+        stop, start = plan_rotation(watched, live, slots,
                                     d.switch_ratio, d.min_watch_s, time.time(), self.pinned())
         live_by_key = {c.key: c for c in live}
         for k, w in self.watchers.items():

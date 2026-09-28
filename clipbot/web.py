@@ -9,6 +9,7 @@ Serveur HTTP minimal (aiohttp) exposé par l'hébergeur :
   /youtube/login     connexion YouTube (protégée par le code d'appairage)
   /youtube/callback  retour OAuth Google
   /kick/webhook      réception du chat Kick (API officielle)
+  /offre             page de vente publique (à partager partout) + paiement crypto
 """
 from __future__ import annotations
 
@@ -39,9 +40,74 @@ Aucune donnée d'autres utilisateurs n'est collectée, vendue ou partagée.</p>
 supprimés sur simple demande ; la connexion peut être révoquée à tout moment depuis
 les paramètres TikTok.</p><p>Contact : {email}</p>"""
 
-TERMS = """<p>Service privé, non commercialisé, réservé à son propriétaire. Les contenus
-publiés respectent les conditions d'utilisation de TikTok et les droits des créateurs
-concernés (crédit systématique de la chaîne d'origine). Contact : {email}</p>"""
+TERMS = """<p>L'intégration TikTok et YouTube de ce service est réservée au compte de son
+propriétaire : elle ne publie que sur ses propres comptes. Les contenus publiés respectent
+les conditions d'utilisation de TikTok et les droits des créateurs concernés (crédit
+systématique de la chaîne d'origine). Contact : {email}</p>"""
+
+OFFER_CSS = """
+:root{--bg:#0e0e12;--card:#17171f;--ink:#f4f4f6;--mute:#a4a4b2;--acc:#ff2d55;--acc2:#25f4ee;--line:#2a2a36}
+@media (prefers-color-scheme:light){:root{--bg:#f6f6f9;--card:#fff;--ink:#131318;
+--mute:#5d5d6b;--line:#e3e3ea;--acc2:#0a8f8a}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
+font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:720px;margin:0 auto;padding:40px 16px 64px}
+.tag{display:inline-block;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase;color:var(--acc2)}
+h1{font-size:clamp(1.8rem,6vw,2.6rem);line-height:1.15;margin:.3em 0 .4em}
+h1 em{font-style:normal;color:var(--acc)}
+p.lead{color:var(--mute);font-size:1.08rem;margin:0 0 28px}
+ul.feat{list-style:none;padding:0;margin:0 0 32px;display:grid;gap:10px}
+ul.feat li{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.cta{display:block;text-align:center;background:var(--acc);color:#fff;text-decoration:none;
+font-weight:700;padding:16px;border-radius:14px;font-size:1.05rem;margin:0 0 36px}
+h2{font-size:1.2rem;margin:0 0 14px}
+.packs{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+.pack{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+.pack b{font-size:1.5rem;display:block}.pack .price{color:var(--mute);margin:4px 0 14px}
+.pack button{width:100%;border:1px solid var(--line);background:transparent;color:var(--ink);
+padding:11px;border-radius:10px;font:inherit;cursor:pointer}
+.pack button:hover{border-color:var(--acc2)}
+small{color:var(--mute);display:block;margin-top:28px}
+"""
+
+
+def offer_page(shop, bot_username: str) -> str:
+    link = f"https://t.me/{bot_username}?start=offre" if bot_username else "#"
+    packs = []
+    for p in shop.packs:
+        crypto = (f'<form method="post" action="/offre/crypto/{p.key}">'
+                  f'<button type="submit">Payer {p.eur:.2f} € en crypto</button></form>'
+                  if shop.crypto_enabled else "")
+        packs.append(f'<div class="pack"><b>{p.credits} clips</b>'
+                     f'<div class="price">{p.stars} ⭐ dans Telegram'
+                     + (f" · ou {p.eur:.2f} €" if shop.crypto_enabled else "") +
+                     f"</div>{crypto}</div>")
+    trial = (f"{shop.cfg.free_trial} clip offert pour essayer, sans rien payer."
+             if shop.cfg.free_trial else "")
+    body = f"""<main>
+<span class="tag">Clips Twitch &amp; Kick → TikTok</span>
+<h1>Ton clip, <em>prêt à poster</em> en quelques minutes.</h1>
+<p class="lead">Envoie un lien de clip Twitch ou Kick au bot Telegram : tu reçois la vidéo
+verticale montée, sous-titrée, et la légende avec hashtags à copier. {trial}</p>
+<ul class="feat">
+<li>📐 Format 9:16 avec cadrage automatique (webcam + jeu, ou plein écran)</li>
+<li>💬 Sous-titres synchronisés mot à mot, traduits si tu veux (FR, EN, ES…)</li>
+<li>🪝 Accroche à l'écran, miniature, son normalisé pour TikTok / Reels / Shorts</li>
+<li>🏷️ Ton @pseudo incrusté, légende + hashtags prêts à coller</li>
+</ul>
+<a class="cta" href="{link}">Ouvrir le bot sur Telegram</a>
+<h2>Tarifs</h2>
+<div class="packs">{''.join(packs)}</div>
+<small>1 crédit = 1 clip livré, débité seulement à la livraison, sans expiration.
+Tu dois avoir le droit de republier les clips que tu envoies (ta chaîne, campagne
+de clipping officielle ou accord du streamer).</small>
+</main>"""
+    return ('<!doctype html><html lang="fr"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Clips prêts à poster</title>'
+            '<meta name="description" content="Envoie un lien de clip Twitch ou Kick, reçois la '
+            'vidéo TikTok montée et sous-titrée.">'
+            f"<style>{OFFER_CSS}</style></head><body>{body}</body></html>")
 
 
 def build_app(a: "App") -> web.Application:
@@ -138,8 +204,35 @@ def build_app(a: "App") -> web.Application:
             log.debug("Webhook Kick illisible : %s", e)
         return web.Response(text="ok")
 
+    # ---------------------------------------------------------------- boutique
+    invoice_hits: dict[str, list[float]] = {}
+
+    async def offer(_):
+        shop = getattr(a, "shop", None)
+        if shop is None or not shop.enabled:
+            raise web.HTTPNotFound(text="offre indisponible")
+        return web.Response(text=offer_page(shop, a.shop_bot.username), content_type="text/html")
+
+    async def offer_crypto(req: web.Request):
+        import time as _t
+        shop = getattr(a, "shop", None)
+        if shop is None or not shop.enabled or not shop.crypto_enabled:
+            raise web.HTTPNotFound(text="paiement crypto indisponible")
+        ip = req.headers.get("X-Forwarded-For", req.remote or "?").split(",")[0].strip()
+        hits = [t for t in invoice_hits.get(ip, []) if _t.time() - t < 3600]
+        if len(hits) >= 10:
+            raise web.HTTPTooManyRequests(text="trop de tentatives, réessaie plus tard")
+        invoice_hits[ip] = hits + [_t.time()]
+        try:
+            url = await shop.crypto_invoice(req.match_info["pack"])
+        except Exception as e:
+            log.warning("Facture crypto impossible : %s", e)
+            raise web.HTTPServiceUnavailable(text="paiement crypto momentanément indisponible")
+        raise web.HTTPSeeOther(url)
+
     app = web.Application(client_max_size=2 * 1024 * 1024)
     app.add_routes([
+        web.get("/offre", offer), web.post("/offre/crypto/{pack}", offer_crypto),
         web.get("/", index), web.get("/health", health),
         web.get("/privacy", privacy), web.get("/terms", terms),
         web.get("/tiktok/login", tiktok_login), web.get("/tiktok/callback", tiktok_callback),

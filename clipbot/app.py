@@ -24,6 +24,8 @@ from .analytics import TikTokAnalytics
 from .models import HypeEvent, StreamCandidate
 from .pipeline import Pipeline
 from .recorder import RawClip
+from .resources import Resources
+from .shop import CUSTOMER_MENU, Shop
 from .storage import Store
 from .telegram import TelegramBot
 from .tiktok import TikTokClient
@@ -283,6 +285,43 @@ class App:
             return (f"Ouvre ce lien et accepte :\n{self.s.server.public_url}/tiktok/login"
                     f"?k={self.s.publish.telegram_pair_code}")
 
+        # ---------------- boutique (vente de clips à d'autres clippeurs)
+        async def boutique(args):
+            if args and args[0].lower() in ("on", "off"):
+                store.set("shop_enabled", args[0].lower() == "on")
+            extra = ("" if self.shop_bot is not tg else
+                     "\n\nConseil : crée un 2e bot via @BotFather pour les clients et mets son "
+                     "jeton dans SHOP_BOT_TOKEN : ton bot de pilotage reste privé et à l'abri.")
+            return (self.shop.summary() + "\n\n/boutique on|off · /offrir <id> <n> · "
+                    "/rembourser <id> <id paiement> · /repondre <id> <message>" + extra)
+
+        async def offrir(args):
+            if len(args) < 2 or not args[0].lstrip("-").isdigit() or not args[1].lstrip("-").isdigit():
+                return "Usage : /offrir <id client> <nombre de clips> (négatif pour retirer)"
+            uid, n = int(args[0]), int(args[1])
+            c = self.shop.customer(uid)
+            self.shop._update(uid, credits=max(0, c.get("credits", 0) + n))
+            if n > 0:
+                await self.shop_bot.reply(uid, f"🎁 +{n} clips offerts ! Envoie-moi un lien de clip.")
+            return f"✅ {uid} : {self.shop.customer(uid)['credits']} crédits."
+
+        async def rembourser(args):
+            if len(args) < 2 or not args[0].isdigit():
+                return "Usage : /rembourser <id client> <id paiement>"
+            try:
+                return await self.shop.refund(int(args[0]), args[1])
+            except Exception as e:
+                return f"❌ Remboursement refusé : {e}"
+
+        async def repondre(args):
+            if len(args) < 2 or not args[0].lstrip("-").isdigit():
+                return "Usage : /repondre <id client> <message>"
+            mid = await self.shop_bot.reply(int(args[0]), "💬 Support : " + " ".join(args[1:]))
+            return "✅ Envoyé." if mid else "❌ Envoi impossible (client inconnu ou bot bloqué)."
+
+        tg.commands.update({"boutique": boutique, "offrir": offrir, "rembourser": rembourser,
+                            "repondre": repondre})
+
         tg.commands.update({"status": status, "auto": auto, "pause": pause, "resume": resume,
                             "add": add, "remove": remove, "chaines": chaines, "tiktok": tiktok, "youtube": youtube, "relance": relance,
                             "lives": lives, "suivre": suivre, "algo": algo, "tag": tag, "outro": outro,
@@ -313,16 +352,44 @@ class App:
                                          self.s.publish.youtube_client_secret,
                                          self.s.publish.youtube_privacy, self.s.server.public_url,
                                          self.store, session)
-            self.pipeline = Pipeline(self.s, self.store, session, self.tg, self.tiktok, self.youtube)
+            # Garde-fou mémoire : un seul travail lourd à la fois, délestage d'un live
+            self.res = Resources()
+            self.pipeline = Pipeline(self.s, self.store, session, self.tg, self.tiktok, self.youtube,
+                                     res=self.res)
+            self.pipeline.CUSTOMER_MAX_WAIT_S = self.s.shop.max_wait_min * 60
             self.orch = Orchestrator(self.s, self.store, session, self._on_clip)
             self.orch.notify = lambda text: asyncio.create_task(self.tg.send("🔎 " + text))
+            self.orch.capacity = lambda: 1 if self.res.under_pressure else \
+                self.s.discovery.max_concurrent_streams
+            self.res.on_pressure = self.orch.rescan
             p = self.s.processing
             self.harvester = ClipHarvester(
                 self.store, session, self.s.capture.work_dir, on_new=self.pipeline.wake,
                 allowed=lambda: {n for _, n in self.orch.scanner.targets()},
-                top_channels=self._top_channels, enabled_top=p.top_clips)
+                top_channels=self._top_channels, enabled_top=p.top_clips, res=self.res)
             if p.viewer_clips:
                 self.orch.on_link = self.harvester.offer
+
+            async def owner_link(text: str) -> str:
+                from .watcher import find_clip_links
+                links = find_clip_links(text) or [w for w in text.split() if w.startswith("http")]
+                return self.harvester.submit(links[0]) if links else ""
+            self.tg.on_owner_link = owner_link
+
+            # Boutique : bot dédié aux clients si SHOP_BOT_TOKEN, sinon le même bot
+            sh = self.s.shop
+            if sh.bot_token and sh.bot_token != self.s.publish.telegram_token:
+                self.shop_bot = TelegramBot(sh.bot_token, "", self.store, session,
+                                            public_only=True, offset_key="shop_offset")
+                self.shop_bot.menu = CUSTOMER_MENU
+            else:
+                self.shop_bot = self.tg
+                self.tg.public_menu = CUSTOMER_MENU if sh.enabled else []
+            self.shop = Shop(self.s, self.store, self.shop_bot, self.tg, session, self.res,
+                             wake=self.pipeline.wake)
+            self.shop_bot.public = self.shop.handle
+            self.pipeline.on_customer_done = self.shop.deliver
+            self.pipeline.on_customer_failed = self.shop.failed
             self.tt_analytics = TikTokAnalytics(self.store, self.tiktok, self.tg.send)
             self._register_commands()
 
@@ -342,7 +409,11 @@ class App:
                 ("backup", self.backup.run()),
                 ("harvester", self.harvester.run()),
                 ("tt_analytics", self.tt_analytics.run()),
+                ("memory", self.res.watchdog()),
             )]
+            if self.shop_bot is not self.tg:
+                tasks.append(asyncio.create_task(self.shop_bot.run(), name="shop_bot"))
+            await self.shop.resume()
             self._log_config()
             await self.tg.send("🟢 clipbot démarré. /status")
             await self._check_tiktok()

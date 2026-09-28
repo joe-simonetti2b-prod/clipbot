@@ -19,6 +19,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import aiohttp
 
@@ -30,6 +31,7 @@ from .layout import analyze
 from .render import render
 from .storage import Store
 from .subtitles import build_ass
+from .resources import Resources
 from .telegram import TelegramBot, copyable
 from .tiktok import TikTokClient, TikTokError
 from .youtube import YouTubeClient, YouTubeError
@@ -41,6 +43,7 @@ EMOJI = {"rire": "😂", "action": "🔥", "demande_clip": "🎬", "burst": "⚡
          "clip_viewer": "📎", "top_clip": "🏆"}
 OUTRO_S = 1.8
 TIKTOK_PENDING_MAX = 5      # brouillons en attente acceptés par TikTok sur 24 h glissantes
+FORCED_NOTE = "envoyé par toi"   # = ClipHarvester.OWNER_NOTE : jamais jeté par l'IA
 DAY = 86400
 
 
@@ -78,13 +81,18 @@ def seconds_until_window(now: float, tz: str, spec: str) -> float:
 
 class Pipeline:
     def __init__(self, settings: Settings, store: Store, session: aiohttp.ClientSession,
-                 telegram: TelegramBot, tiktok: TikTokClient, youtube: YouTubeClient | None = None):
+                 telegram: TelegramBot, tiktok: TikTokClient, youtube: YouTubeClient | None = None,
+                 res: Resources | None = None):
         self.s = settings
         self.store = store
         self.session = session
         self.tg = telegram
         self.tiktok = tiktok
         self.youtube = youtube
+        self.res = res
+        # Boutique : livraison / remboursement des clips commandés par des clients
+        self.on_customer_done: Callable[[dict, Path, object], Awaitable[None]] | None = None
+        self.on_customer_failed: Callable[[dict, str], Awaitable[None]] | None = None
         self.final_dir = settings.capture.work_dir / "final"
         self.final_dir.mkdir(parents=True, exist_ok=True)
         self._process_wake = asyncio.Event()
@@ -106,9 +114,11 @@ class Pipeline:
     def trim_backlog(self) -> None:
         """La machine gratuite monte ~1 clip toutes les 5-10 min : si les pics arrivent
         plus vite, on ne garde en attente que les meilleurs."""
+        # Jamais les commandes clients (payées) ni les clips que tu as envoyés toi-même
         rows = self.store.db.execute(
-            "SELECT * FROM clips WHERE status='extracted' ORDER BY score DESC, created DESC"
-        ).fetchall()
+            "SELECT * FROM clips WHERE status='extracted' AND customer_id IS NULL "
+            "AND COALESCE(tokens, '') NOT LIKE ? ORDER BY score DESC, created DESC",
+            (FORCED_NOTE + "%",)).fetchall()
         # Le meilleur clip de chaque créateur est toujours gardé, puis les meilleurs scores
         keep, seen = [], set()
         for r in rows:
@@ -237,9 +247,26 @@ class Pipeline:
         return "\n  " + " · ".join(parts)
 
     # ------------------------------------------------------- post-production
+    CUSTOMER_MAX_WAIT_S = 30 * 60
+
+    def next_job(self):
+        """Notre compte d'abord ; une commande client passe devant seulement si elle
+        attend depuis plus de CUSTOMER_MAX_WAIT_S (sinon un live très animé la
+        bloquerait indéfiniment)."""
+        oldest = self.store.db.execute(
+            "SELECT * FROM clips WHERE status='extracted' AND customer_id IS NOT NULL "
+            "ORDER BY created LIMIT 1").fetchone()
+        if oldest and time.time() - oldest["created"] > self.CUSTOMER_MAX_WAIT_S:
+            return oldest
+        forced = self.store.db.execute(
+            "SELECT * FROM clips WHERE status='extracted' AND customer_id IS NULL "
+            "AND tokens LIKE ? ORDER BY created LIMIT 1", (FORCED_NOTE + "%",)).fetchone()
+        return (forced or self.store.next_clip("extracted", avoid_channel=self._last_channel,
+                                               own_only=True) or oldest)
+
     async def run_processor(self) -> None:
         while True:
-            row = self.store.next_clip("extracted", avoid_channel=self._last_channel)
+            row = self.next_job()
             if row is None:
                 self._process_wake.clear()
                 try:
@@ -257,6 +284,20 @@ class Pipeline:
             except Exception as e:
                 log.exception("Clip %s en échec", row["id"])
                 self.store.update_clip(row["id"], status="failed", error=str(e)[:500])
+                if row["customer_id"] and self.on_customer_failed:
+                    try:
+                        await self.on_customer_failed(dict(row), str(e))
+                    except Exception:
+                        log.exception("Remboursement du clip %s impossible", row["id"])
+
+    async def _heavy(self, coro_fn):
+        """Travail lourd (cadrage + montage) : jamais en même temps qu'un téléchargement,
+        et seulement quand la mémoire le permet."""
+        if self.res is None:
+            return await coro_fn()
+        async with self.res.heavy:
+            await self.res.wait_room(200)
+            return await coro_fn()
 
     async def _process(self, clip: dict) -> None:
         cid = clip["id"]
@@ -270,17 +311,26 @@ class Pipeline:
         tr = await transcribe(src, offset, duration, p.whisper_model, p.whisper_threads,
                               groq_key=p.groq_api_key, session=self.session,
                               keep_loaded=p.whisper_keep_loaded)
-        # Mentions exigées par la campagne de ce streamer + appel à l'action global
-        tags = p.channel_tags.get((clip["channel"] or "").lower(), "")
-        whop = self.store.get("whop_campaigns", {}).get((clip["channel"] or "").lower())
-        whop_rules = whop.get("rules") if whop else ""
-        cta = "\n".join(x for x in (tags, whop_rules, p.cta_text) if x)
+        customer = bool(clip.get("customer_id"))
+        # Clip commandé (client) ou envoyé par toi : jamais jeté, réglages propres
+        forced = customer or (clip.get("tokens") or "").startswith(FORCED_NOTE)
+        if customer:
+            lang = clip.get("customer_lang")
+            target = "" if lang == "original" else (lang or p.target_lang)
+            cta, watermark = "", clip.get("customer_tag") or ""
+        else:
+            target, watermark = p.target_lang, self.watermark
+            # Mentions exigées par la campagne de ce streamer + appel à l'action global
+            tags = p.channel_tags.get((clip["channel"] or "").lower(), "")
+            whop = self.store.get("whop_campaigns", {}).get((clip["channel"] or "").lower())
+            whop_rules = whop.get("rules") if whop else ""
+            cta = "\n".join(x for x in (tags, whop_rules, p.cta_text) if x)
         llm = LLM.from_settings(p)
         # Note + textes d'abord : un clip mal noté n'est jamais monté (gain de CPU)
-        out_lang = p.target_lang or tr.language or "fr"
+        out_lang = target or tr.language or "fr"
         copy = await write_copy(self.session, llm, clip, tr.text, out_lang, cta, p.ad_disclosure)
 
-        if copy.score is not None and copy.score < p.min_ai_score:
+        if not forced and copy.score is not None and copy.score < p.min_ai_score:
             log.info("Clip %s jeté par l'IA (note %s/10)", cid, copy.score)
             self.store.update_clip(cid, status="discarded", ai_score=copy.score,
                                    transcript=tr.text, hook=copy.hook)
@@ -289,26 +339,43 @@ class Pipeline:
             return
 
         words = tr.words
-        translated = await translate_words(self.session, llm, tr.words, tr.language, p.target_lang)
+        translated = None
+        if target:
+            translated = await translate_words(self.session, llm, tr.words, tr.language, target)
         if translated:
             words = translated
-            log.info("Clip %s : sous-titres traduits %s -> %s", cid, tr.language, p.target_lang)
+            log.info("Clip %s : sous-titres traduits %s -> %s", cid, tr.language, target)
 
-        layout = await analyze(src, offset, duration)
         out = self.final_dir / f"clip_{cid}.mp4"
         domain = {"twitch": "twitch.tv", "kick": "kick.com"}.get(clip["platform"], "")
         credit = f"{domain}/{clip['channel']}" if (p.video_credit and domain) else ""
-        outro_s = OUTRO_S if self.outro else 0.0
-        ass = build_ass(words, copy.hook, layout.kind, duration, p.font, credit,
-                        karaoke=not translated, keywords=copy.keywords, cover=copy.cover,
-                        creator=clip["channel"], watermark=self.watermark, outro_s=outro_s,
-                        peak_at=clip.get("peak_at"))
-        if not await render(src, offset, duration, layout, ass, out,
-                            height=p.output_height, preset=p.x264_preset,
-                            threads=p.ffmpeg_threads, outro_s=outro_s):
+        # Outro « S'abonner » : pour un client, seulement s'il a donné son pseudo
+        outro_s = OUTRO_S if (self.outro and (watermark or not customer)) else 0.0
+
+        async def montage():
+            layout = await analyze(src, offset, duration)
+            ass = build_ass(words, copy.hook, layout.kind, duration, p.font, credit,
+                            karaoke=not translated, keywords=copy.keywords, cover=copy.cover,
+                            creator=clip["channel"], watermark=watermark, outro_s=outro_s,
+                            peak_at=clip.get("peak_at"))
+            ok = await render(src, offset, duration, layout, ass, out,
+                              height=p.output_height, preset=p.x264_preset,
+                              threads=p.ffmpeg_threads, outro_s=outro_s)
+            return layout, ok
+
+        layout, ok = await self._heavy(montage)
+        if not ok:
             raise RuntimeError("montage FFmpeg échoué")
 
         src.unlink(missing_ok=True)  # le brut ne sert plus
+        if customer:
+            self.store.update_clip(cid, status="delivering", raw_path=None, final_path=str(out),
+                                   transcript=tr.text, hook=copy.hook, caption=copy.caption,
+                                   ai_score=copy.score)
+            log.info("Commande client %s montée en %.0fs", cid, time.time() - t0)
+            if self.on_customer_done:
+                await self.on_customer_done(dict(self.store.clip(cid)), out, copy)
+            return
         self.store.update_clip(cid, status="ready", raw_path=None, final_path=str(out),
                                transcript=tr.text, hook=copy.hook, caption=copy.caption,
                                ai_score=copy.score)

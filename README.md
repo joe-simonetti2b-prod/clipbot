@@ -142,6 +142,32 @@ Soumets l'app, puis tape `/tiktok` dans Telegram une fois qu'elle est validée.
    tap. Vidéo → ⋮ → *Partager* → TikTok, colle la légende, puis *✅ Posté sur TikTok*.
 Un clip de plus de `FRESH_HOURS` heures n'est plus publié.
 
+Tu peux aussi envoyer toi-même un lien de clip Twitch/Kick au bot : il est monté pour
+ton compte en priorité, quelle que soit la chaîne, sans jamais être jeté par l'IA.
+
+## Boutique : vendre le bot comme outil
+
+N'importe qui envoie un lien de clip Twitch/Kick au bot (ou `/clip <lien>` dans un
+groupe où le bot est ajouté) et reçoit la vidéo montée + la légende à copier.
+- **Paiement dans Telegram : Étoiles ⭐** (règle Telegram : un service numérique vendu
+  dans un bot se paie en Étoiles). Rien à configurer. Retrait en TON via Fragment
+  (~0,013 $ l'étoile, 21 jours de délai, minimum 1 000 ⭐).
+- **Hors Telegram : page `/offre`** (à mettre en bio TikTok, sur Discord…). Paiement crypto
+  si `CRYPTOPAY_TOKEN` est rempli (@CryptoBot → Crypto Pay → Create App). Après paiement,
+  le client ouvre le bot par un lien à usage unique qui crédite son compte.
+- 1 crédit = 1 clip livré, débité à la livraison seulement (un échec ne coûte rien).
+- **Ton compte reste prioritaire** : une commande ne passe devant tes clips qu'après
+  `SHOP_MAX_WAIT_MIN` minutes d'attente. File limitée (`SHOP_MAX_QUEUE`, `SHOP_PER_USER`).
+- Conseillé : un bot séparé pour les clients (`SHOP_BOT_TOKEN`, créé via @BotFather) :
+  ton bot de pilotage reste privé, et un souci côté boutique ne le touche pas.
+
+| Commande (toi) | Effet |
+|---|---|
+| `/boutique [on\|off]` | ventes, clients, encaissé ; ouvrir / fermer |
+| `/offrir <id> <n>` | offrir (ou retirer) des clips à un client |
+| `/rembourser <id> <paiement>` | rembourser un paiement en Étoiles |
+| `/repondre <id> <message>` | répondre à une demande `/paysupport` |
+
 ## Rentabilité : réglages clés (v2)
 
 | Variable | Effet | Valeur conseillée |

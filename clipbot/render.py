@@ -19,6 +19,8 @@ import asyncio
 import logging
 from pathlib import Path
 
+from .resources import niced
+
 from .layout import Layout
 
 log = logging.getLogger(__name__)
@@ -91,7 +93,9 @@ async def render(src: Path, offset: float, duration: float, layout: Layout,
         "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
         "-movflags", "+faststart", str(out),
     ]
-    proc = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
+    # Priorité basse : sur 0,1 CPU, un montage à pleine priorité affamait le programme
+    # principal et Render le redémarrait (contrôle de santé sans réponse en 5 s).
+    proc = await asyncio.create_subprocess_exec(*niced(cmd), stderr=asyncio.subprocess.PIPE)
     _, err = await proc.communicate()
     ass_path.unlink(missing_ok=True)
     if proc.returncode != 0:

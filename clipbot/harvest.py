@@ -27,6 +27,7 @@ import aiohttp
 
 from .models import StreamCandidate
 from .public import TWITCH_GQL, TWITCH_WEB_CLIENT_ID
+from .resources import Resources, niced
 from .storage import Store
 
 log = logging.getLogger(__name__)
@@ -59,9 +60,11 @@ def accept_owner(info: dict, allowed: set[str]) -> bool:
 class ClipHarvester:
     def __init__(self, store: Store, session: aiohttp.ClientSession, work_dir: Path,
                  on_new: Callable[[], None], allowed: Callable[[], set[str]],
-                 top_channels: Callable[[], list[str]], enabled_top: bool = True):
+                 top_channels: Callable[[], list[str]], enabled_top: bool = True,
+                 res: Resources | None = None):
         self.store = store
         self.session = session
+        self.res = res
         self.dir = work_dir / "clips"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.on_new = on_new
@@ -96,6 +99,30 @@ class ClipHarvester:
         except asyncio.QueueFull:
             pass
 
+    OWNER_NOTE = "envoyé par toi"
+
+    def trusted(self, note: str) -> bool:
+        return note == self.OWNER_NOTE
+
+    def submit(self, url: str) -> str:
+        """Lien de clip envoyé par le propriétaire au bot : monté pour NOTRE compte,
+        quelle que soit la chaîne, en priorité maximale."""
+        if urlparse(url).hostname not in ALLOWED_HOSTS:
+            return "Lien non pris en charge (clips Twitch ou Kick uniquement)."
+        cid = clip_id(url)
+        if self._known(cid):
+            return "Ce clip est déjà passé par le bot."
+        from .models import Platform
+        plat = Platform.KICK if "kick.com" in url else Platform.TWITCH
+        c = StreamCandidate(platform=plat, channel="?", stream_id=cid, url=url,
+                            title="", category="", viewers=0)
+        self._seen[cid] = time.time()
+        try:
+            self.queue.put_nowait((c, url, self.OWNER_NOTE, 0.0))
+        except asyncio.QueueFull:
+            return "File de téléchargement pleine, renvoie-le dans quelques minutes."
+        return "📥 Reçu : je le télécharge et je le monte pour ton compte (priorité max)."
+
     def _known(self, cid: str) -> bool:
         row = self.store.db.execute(
             "SELECT 1 FROM clips WHERE stream_url LIKE ? LIMIT 1", (f"%{cid}%",)).fetchone()
@@ -123,38 +150,19 @@ class ClipHarvester:
                 log.warning("Clip %s non récupéré : %s", url, e)
 
     async def _fetch(self, c: StreamCandidate, url: str, note: str, views: float) -> None:
-        if urlparse(url).hostname not in ALLOWED_HOSTS:
-            raise RuntimeError(f"hôte non autorisé : {url}")
         cid = clip_id(url)
-        base = self.dir / f"clip_{re.sub(r'[^a-z0-9_-]', '', cid)[:60]}"
-        proc = await asyncio.create_subprocess_exec(
-            "yt-dlp", "--quiet", "--no-warnings", "--no-playlist", "--no-part",
-            "-f", "best[height<=720]/best", "--max-filesize", "120M",
-            "--write-info-json", "-o", f"{base}.%(ext)s", url,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        try:
-            _, err = await asyncio.wait_for(proc.communicate(), 180)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise RuntimeError("téléchargement trop long")
-        info_path = base.with_suffix(".info.json")
-        info = json.loads(info_path.read_text()) if info_path.exists() else {}
-        info_path.unlink(missing_ok=True)
-        files = [p for p in self.dir.glob(base.name + ".*") if p.suffix not in (".json", ".part")]
-        if proc.returncode != 0 or not files:
-            raise RuntimeError(err.decode(errors="ignore").strip()[-200:] or "yt-dlp a échoué")
-        path = files[0]
-        if not accept_owner(info, self.allowed() | {c.channel.lower()}):
+        path, info, duration = await download_clip(url, self.dir, self.res)
+        trusted = self.trusted(note)
+        if not (trusted or accept_owner(info, self.allowed() | {c.channel.lower()})):
             path.unlink(missing_ok=True)
             log.info("Clip %s ignoré : chaîne non suivie (%s)", url, info.get("uploader"))
             return
-        duration = float(info.get("duration") or 0) or await _probe_duration(path)
-        if not duration or duration < 5:
-            path.unlink(missing_ok=True)
-            raise RuntimeError("clip vide ou trop court")
         views = views or float(info.get("view_count") or 0)
         mentions = len(self._mentions.get(cid, ()))
-        if note.startswith("posté"):
+        if trusted:
+            reason, score = "clip_viewer", 10.0
+            c.channel = broadcaster(info) or "clip"
+        elif note.startswith("posté"):
             reason, score = "clip_viewer", 9.0 + min(mentions - 1, 3)
         else:
             reason, score = "top_clip", min(10.0, 5.0 + math.log10(max(views, 1)))
@@ -225,6 +233,58 @@ class ClipHarvester:
         log.info("🏆 Top clip du jour : %s (%s, %s vues)", best.get("title"), best["login"],
                  best.get("viewCount"))
         await self.queue.put((c, url, "top clip du jour", float(best.get("viewCount") or 0)))
+
+
+def broadcaster(info: dict) -> str:
+    """Chaîne d'origine d'un clip (et non la personne qui l'a clippé)."""
+    for k in ("channel", "uploader_id", "uploader"):
+        v = str(info.get(k) or "").strip()
+        if v:
+            return v.lower().replace(" ", "")
+    return ""
+
+
+async def download_clip(url: str, dest: Path, res=None) -> tuple[Path, dict, float]:
+    """Télécharge un clip Twitch/Kick (lien vérifié). Un seul travail lourd à la fois
+    (mémoire limitée) et en priorité basse. Renvoie (fichier, infos, durée)."""
+    if urlparse(url).hostname not in ALLOWED_HOSTS:
+        raise RuntimeError(f"hôte non autorisé : {url}")
+    dest.mkdir(parents=True, exist_ok=True)
+    base = dest / f"clip_{re.sub(r'[^a-z0-9_-]', '', clip_id(url))[:60]}_{int(time.time())}"
+    cmd = niced(["yt-dlp", "--quiet", "--no-warnings", "--no-playlist", "--no-part",
+                 "-f", "best[height<=720]/best", "--max-filesize", "120M",
+                 "--write-info-json", "-o", f"{base}.%(ext)s", url])
+
+    async def run():
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), 180)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("téléchargement trop long")
+        return proc.returncode, err
+
+    if res is not None:
+        async with res.heavy:
+            await res.wait_room(120, max_wait_s=300)
+            code, err = await run()
+    else:
+        code, err = await run()
+    info_path = base.with_suffix(".info.json")
+    info = json.loads(info_path.read_text()) if info_path.exists() else {}
+    info_path.unlink(missing_ok=True)
+    files = [p for p in dest.glob(base.name + ".*") if p.suffix not in (".json", ".part")]
+    if code != 0 or not files:
+        for p in files:
+            p.unlink(missing_ok=True)
+        raise RuntimeError(err.decode(errors="ignore").strip()[-200:] or "yt-dlp a échoué")
+    path = files[0]
+    duration = float(info.get("duration") or 0) or await _probe_duration(path)
+    if not duration or duration < 3:
+        path.unlink(missing_ok=True)
+        raise RuntimeError("clip vide ou trop court")
+    return path, info, duration
 
 
 async def _probe_duration(path: Path) -> float:

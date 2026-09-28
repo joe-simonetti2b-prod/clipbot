@@ -177,6 +177,25 @@ class ServerConfig:
 
 
 @dataclass
+class ShopConfig:
+    """Boutique : n'importe qui peut envoyer un lien de clip Twitch/Kick au bot et
+    recevoir la vidéo montée (9:16, sous-titres, accroche, légende), payée en Étoiles
+    Telegram. Notre compte reste prioritaire dans la file de montage."""
+    enabled: bool = _env("SHOP", "true", _bool)
+    # Bot dédié aux clients (recommandé : isole ton bot de pilotage). Vide = même bot.
+    bot_token: str = _env("SHOP_BOT_TOKEN")
+    # Packs « crédits:étoiles:euros » (euros = prix du paiement crypto sur la page /offre)
+    packs: str = _env("SHOP_PACKS", "3:150:2,10:450:6,30:1200:15")
+    free_trial: int = _env("SHOP_FREE_TRIAL", "1", int)       # clips offerts au 1er contact
+    max_queue: int = _env("SHOP_MAX_QUEUE", "15", int)        # commandes en attente, tous clients
+    per_user: int = _env("SHOP_PER_USER", "3", int)           # commandes en attente par client
+    max_wait_min: int = _env("SHOP_MAX_WAIT_MIN", "30", int)  # au-delà, passe devant nos clips
+    # Paiement crypto hors Telegram (page /offre) via Crypto Pay (@CryptoBot → Crypto Pay)
+    cryptopay_token: str = _env("CRYPTOPAY_TOKEN")
+    cryptopay_assets: str = _env("CRYPTOPAY_ASSETS", "USDT,TON,BTC")
+
+
+@dataclass
 class Settings:
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     hype: HypeConfig = field(default_factory=HypeConfig)
@@ -184,3 +203,4 @@ class Settings:
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     publish: PublishConfig = field(default_factory=PublishConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    shop: ShopConfig = field(default_factory=ShopConfig)

@@ -12,6 +12,7 @@ message est illisible sans le jeton du bot, qui ne quitte jamais Render.
 from __future__ import annotations
 
 import asyncio
+import aiohttp
 import base64
 import hashlib
 import hmac
@@ -25,7 +26,9 @@ PERSISTED = ("tiktok_tokens", "youtube_tokens", "auto_publish", "paused",
              "extra_channels", "telegram_owner", "youtube_quota",
              "pinned_channels", "watermark", "outro", "whop_campaigns",
              "tiktok_inbox_log", "manual_log", "channel_perf_boost", "rewards_last_pct",
-             "tiktok_analytics_denied")
+             "tiktok_analytics_denied",
+             # Boutique : crédits et paiements des clients, commandes en cours
+             "shop_enabled", "shop_customers", "shop_payments", "shop_jobs", "shop_codes")
 HEADER = "💾 Sauvegarde clipbot — ne pas supprimer ni désépingler\n"
 
 
@@ -79,7 +82,18 @@ class TelegramBackup:
         except Exception as e:
             log.warning("Sauvegarde Telegram illisible : %s", e)
             return 0
-        text = (chat.get("pinned_message") or {}).get("text", "")
+        pinned = chat.get("pinned_message") or {}
+        text = pinned.get("text", "")
+        if pinned.get("document") and (pinned.get("caption") or "").startswith(HEADER.strip()[:20]):
+            # Format actuel : fichier joint (pas de limite de 4096 caractères)
+            try:
+                f = await self.tg._call("getFile", json={"file_id": pinned["document"]["file_id"]})
+                url = f"https://api.telegram.org/file/bot{self.secret}/{f['file_path']}"
+                async with self.tg.session.get(url) as r:
+                    text = HEADER + (await r.read()).decode()
+            except Exception as e:
+                log.warning("Fichier de sauvegarde illisible : %s", e)
+                return 0
         if not text.startswith(HEADER.strip()[:20]):
             return 0
         data = unseal(text.split("\n", 1)[-1], self.secret)
@@ -120,18 +134,30 @@ class TelegramBackup:
         state = json.dumps(snap, sort_keys=True)
         if state == self._last:
             return
-        text = HEADER + seal(snap, self.secret)
+        # Fichier joint plutôt que texte : les crédits des clients de la boutique
+        # dépasseraient vite la limite de 4096 caractères d'un message.
+        blob = seal(snap, self.secret).encode()
+        caption = HEADER.strip()
         mid = self.store.get("backup_message_id")
         if mid:
+            form = aiohttp.FormData()
+            form.add_field("chat_id", str(self.tg.owner))
+            form.add_field("message_id", str(mid))
+            form.add_field("media", json.dumps({"type": "document", "media": "attach://f",
+                                                "caption": caption}))
+            form.add_field("f", blob, filename="clipbot-backup.txt", content_type="text/plain")
             try:
-                await self.tg._call("editMessageText", json={
-                    "chat_id": self.tg.owner, "message_id": mid, "text": text})
+                await self.tg._call("editMessageMedia", data=form)
                 self._last = state
                 return
             except Exception:
-                pass  # message supprimé : on en recrée un
-        msg = await self.tg._call("sendMessage", json={
-            "chat_id": self.tg.owner, "text": text, "disable_notification": True})
+                pass  # message supprimé ou ancien format texte : on en recrée un
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(self.tg.owner))
+        form.add_field("caption", caption)
+        form.add_field("disable_notification", "true")
+        form.add_field("document", blob, filename="clipbot-backup.txt", content_type="text/plain")
+        msg = await self.tg._call("sendDocument", data=form)
         await self.tg._call("pinChatMessage", json={
             "chat_id": self.tg.owner, "message_id": msg["message_id"],
             "disable_notification": True})

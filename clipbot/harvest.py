@@ -21,6 +21,7 @@ import os
 import re
 import signal
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
@@ -63,10 +64,11 @@ class ClipHarvester:
     def __init__(self, store: Store, session: aiohttp.ClientSession, work_dir: Path,
                  on_new: Callable[[], None], allowed: Callable[[], set[str]],
                  top_channels: Callable[[], list[str]], enabled_top: bool = True,
-                 res: Resources | None = None):
+                 res: Resources | None = None, esport: Callable[[], bool] = lambda: False):
         self.store = store
         self.session = session
         self.res = res
+        self.esport = esport
         self.dir = work_dir / "clips"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.on_new = on_new
@@ -79,6 +81,7 @@ class ClipHarvester:
         self._last_by_creator: dict[str, float] = {}
         self._recent: list[float] = []
         self._top_disabled = False
+        self._basic_query = False
 
     # ------------------------------------------------------------ entrée chat
     def offer(self, c: StreamCandidate, url: str, author: str) -> None:
@@ -189,17 +192,26 @@ class ClipHarvester:
                 raise
             except Exception as e:
                 log.warning("Top clips Twitch indisponibles : %s", e)
-            await asyncio.sleep(TOP_EVERY_S)
+            # Esport : les clips d'un match explosent en quelques minutes, on passe plus souvent
+            await asyncio.sleep(TOP_EVERY_S * (2 / 3 if self.esport() else 1))
 
     async def top_clips(self, logins: list[str]) -> list[dict]:
+        # Champs en plus (date, jeu) pour classer par vitesse et filtrer l'esport ; si Twitch
+        # les refuse un jour, on retombe sur la requête simple (déjà éprouvée).
+        extra = "" if self._basic_query else " createdAt game { name }"
         query = ("query { users(logins: %s) { login clips(first: 5, criteria: {filter: LAST_DAY}) "
-                 "{ edges { node { slug title viewCount durationSeconds url } } } } }"
-                 % json.dumps(logins[:30]))
+                 "{ edges { node { slug title viewCount durationSeconds url%s } } } } }"
+                 % (json.dumps(logins[:30]), extra))
         async with self.session.post(TWITCH_GQL, json={"query": query},
                                      headers={"Client-ID": TWITCH_WEB_CLIENT_ID},
                                      timeout=aiohttp.ClientTimeout(total=20)) as r:
             payload = await r.json(content_type=None)
         if payload.get("errors") and not (payload.get("data") or {}).get("users"):
+            if not self._basic_query:
+                log.warning("Top clips : champs étendus refusés (%s) -> requête simple",
+                            payload["errors"][0].get("message"))
+                self._basic_query = True
+                return await self.top_clips(logins)
             raise RuntimeError(payload["errors"][0].get("message"))
         out = []
         for u in (payload.get("data") or {}).get("users") or []:
@@ -209,33 +221,54 @@ class ClipHarvester:
                     out.append({"login": u["login"].lower(), **n})
         return out
 
+    def pick_top(self, clips: list[dict], n: int, now: float | None = None) -> list[dict]:
+        """Les clips qui MONTENT le plus vite (vues / heure depuis leur création), pas les
+        plus vus en absolu : un clip de 30 min déjà à 2 000 vues vaut mieux qu'un clip de
+        20 h à 5 000 — les autres comptes de clips l'ont déjà tous posté."""
+        now = now or time.time()
+        esport = self.esport()
+        from . import esport as es
+
+        def age_h(c):
+            try:
+                ts = datetime.fromisoformat(str(c["createdAt"]).replace("Z", "+00:00")).timestamp()
+                return max(0.25, (now - ts) / 3600)
+            except (KeyError, ValueError):
+                return 12.0                        # date inconnue : âge moyen supposé
+        out = []
+        for c in sorted(clips, key=lambda c: (c.get("viewCount") or 0) / age_h(c), reverse=True):
+            if (c.get("viewCount") or 0) < TOP_MIN_VIEWS:
+                continue
+            game = ((c.get("game") or {}).get("name") or "").lower()
+            if esport and game and game not in es.GAMES:
+                continue                           # ex : Kameto en Just Chatting
+            cid = str(c["slug"]).lower()
+            if cid in self._seen or self._known(cid):
+                continue
+            out.append(c)
+            if len(out) >= n:
+                break
+        return out
+
     async def _harvest_top(self) -> None:
         logins = list(dict.fromkeys(self.top_channels()))
         if not logins:
             return
         clips = await self.top_clips(logins)
-        best = None
-        for n in sorted(clips, key=lambda n: n.get("viewCount") or 0, reverse=True):
-            if (n.get("viewCount") or 0) < TOP_MIN_VIEWS:
-                break
-            cid = str(n["slug"]).lower()
-            if cid in self._seen or self._known(cid):
-                continue
-            best = n
-            break
+        best = self.pick_top(clips, 2 if self.esport() else 1)
         if not best:
             log.info("Top clips : rien de nouveau (%d clips vus)", len(clips))
             return
-        cid = str(best["slug"]).lower()
-        self._seen[cid] = time.time()
-        url = best.get("url") or f"https://clips.twitch.tv/{best['slug']}"
         from .models import Platform
-        c = StreamCandidate(platform=Platform.TWITCH, channel=best["login"], stream_id=cid,
-                            url=f"https://www.twitch.tv/{best['login']}", title=best.get("title") or "",
-                            category="", viewers=0)
-        log.info("🏆 Top clip du jour : %s (%s, %s vues)", best.get("title"), best["login"],
-                 best.get("viewCount"))
-        await self.queue.put((c, url, "top clip du jour", float(best.get("viewCount") or 0)))
+        for b in best:
+            cid = str(b["slug"]).lower()
+            self._seen[cid] = time.time()
+            url = b.get("url") or f"https://clips.twitch.tv/{b['slug']}"
+            c = StreamCandidate(platform=Platform.TWITCH, channel=b["login"], stream_id=cid,
+                                url=f"https://www.twitch.tv/{b['login']}", title=b.get("title") or "",
+                                category=(b.get("game") or {}).get("name") or "", viewers=0)
+            log.info("🏆 Top clip : %s (%s, %s vues)", b.get("title"), b["login"], b.get("viewCount"))
+            await self.queue.put((c, url, "top clip du jour", float(b.get("viewCount") or 0)))
 
 
 def clip_url(url: str) -> str:

@@ -52,16 +52,15 @@ def clip_caption(header: str, caption: str) -> str:
             f"{copyable(caption, max(room, 100))}")
 
 
+# Menu court : l'essentiel. Tout le reste est dans /menu (boutons) et /aide (liste complète).
 OWNER_MENU = [
-    ("status", "État du bot"), ("auto", "on/off publication auto"),
-    ("pause", "Mettre en pause"), ("resume", "Reprendre"),
-    ("add", "Suivre une chaîne"), ("remove", "Ne plus suivre"),
-    ("chaines", "Chaînes suivies"), ("tiktok", "Connecter TikTok"),
-    ("youtube", "Connecter YouTube Shorts"),
-    ("relance", "Renvoyer la file vers TikTok"),
-    ("lives", "Choisir les lives suivis"), ("algo", "Lives choisis par l'algorithme"),
-    ("tag", "Tag incrusté sur les vidéos"), ("outro", "on/off fin avec S'abonner"),
-    ("whop", "Campagnes Whop suivies"), ("boutique", "Ventes aux clients"),
+    ("menu", "Tout piloter avec des boutons"),
+    ("status", "État du bot"),
+    ("esport", "Mode esport on/off"),
+    ("lives", "Choisir les lives suivis"),
+    ("relance", "Envoyer la file vers TikTok"),
+    ("boutique", "Ventes aux clients"),
+    ("aide", "Toutes les commandes"),
 ]
 
 

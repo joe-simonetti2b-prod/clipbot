@@ -322,9 +322,15 @@ class TrendScanner:
     def __init__(self, cfg: DiscoveryConfig, session: aiohttp.ClientSession,
                  extra_channels: Callable[[], list[str]] = lambda: [],
                  on_resolved: Callable[[Resolution], None] | None = None,
-                 perf: Callable[[], dict] = lambda: {}):
+                 perf: Callable[[], dict] = lambda: {},
+                 esport: Callable[[], bool] = lambda: False,
+                 pinned: Callable[[], list[str]] = lambda: []):
         self.cfg = cfg
         self.extra_channels = extra_channels
+        # Mode esport (/esport) : liste esport intégrée à la place de la liste habituelle,
+        # plus les lives choisis à la main (/lives), qui restent toujours prioritaires.
+        self.esport = esport
+        self.pinned = pinned
         self.on_resolved = on_resolved
         # Multiplicateur par chaîne appris de la vraie performance TikTok (clipbot.analytics) :
         # les chaînes dont les clips font plus de vues gagnent du temps de veille en plus.
@@ -340,7 +346,11 @@ class TrendScanner:
         self.last_scan_failed = False
 
     def specs(self) -> list[tuple[str | None, str]]:
-        raw = self.cfg.allowed_channels + self.extra_channels()
+        if self.esport():
+            from . import esport
+            raw = esport.specs() + self.pinned()
+        else:
+            raw = self.cfg.allowed_channels + self.extra_channels()
         return list(dict.fromkeys(parse_spec(s) for s in raw if s.strip()))
 
     async def ensure_resolved(self) -> None:
@@ -415,11 +425,21 @@ class TrendScanner:
                 live += r
         wanted = set(targets)
         live = [c for c in live if (c.platform, c.channel.lower()) in wanted]
-        focus = {parse_spec(f)[1] for f in self.cfg.focus_channels}
         perf = self.perf()
+        if self.esport():
+            from . import esport
+            pinned = {parse_spec(p)[1] for p in self.pinned()}
+            # Seulement un jeu esport (et un vrai match pour Kameto & co) ; un choix
+            # manuel passe toujours.
+            live = [c for c in live if esport.accepts(c) or c.channel.lower() in pinned]
+            for c in live:
+                c.boost = esport.boost(c) if c.channel.lower() in esport.ALL else 1.0
+        else:
+            focus = {parse_spec(f)[1] for f in self.cfg.focus_channels}
+            for c in live:
+                if c.channel.lower() in focus:
+                    c.boost = self.cfg.focus_boost
         for c in live:
-            if c.channel.lower() in focus:
-                c.boost = self.cfg.focus_boost
             c.boost *= perf.get(c.channel.lower(), 1.0)
         live.sort(key=lambda c: c.weight, reverse=True)
         top = ", ".join(f"{c.channel}({c.platform.value[0]}{'★' if c.boost > 1 else ''}) {c.viewers}"

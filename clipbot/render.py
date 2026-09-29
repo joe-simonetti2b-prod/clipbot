@@ -30,10 +30,30 @@ def _even(x: float) -> int:
     return int(round(x / 2)) * 2
 
 
-def build_filter(layout: Layout, ass_path: Path, height: int = 1920, outro_s: float = 0.0) -> str:
+PUNCH_ZOOM = 1.12      # zoom « punch-in » sur le moment fort (coupe franche, style TikTok)
+PUNCH_S = 1.3
+
+
+def build_filter(layout: Layout, ass_path: Path, height: int = 1920, outro_s: float = 0.0,
+                 punch: tuple[float, float] | None = None) -> str:
     pad = f"tpad=stop_mode=clone:stop_duration={outro_s:.2f}," if outro_s > 0 else ""
+    zoom = ""
+    if punch:
+        # Seules les ~40 images du moment fort sont agrandies (coût quasi nul) puis
+        # superposées au reste ; avant et après, l'image est strictement identique.
+        W, H = _even(height * 9 / 16), height
+        a, b = punch
+        zoom = (f"split=2[pa][pb];[pb]trim=start={a:.2f}:end={b:.2f},"
+                f"scale=w=trunc(iw*{PUNCH_ZOOM}/2)*2:h=-2,crop={W}:{H}[pz];"
+                f"[pa][pz]overlay=eof_action=pass:repeatlast=0,")
     return _layout_filter(layout, ass_path, height).replace(
-        "fps=30,", f"fps=30:start_time=0,{pad}", 1)
+        "fps=30,", f"fps=30:start_time=0,{pad}{zoom}", 1)
+
+
+def punch_window(peak_at: float | None, duration: float) -> tuple[float, float] | None:
+    if peak_at is None or not (0.6 < peak_at < duration - 0.6):
+        return None
+    return max(0.0, peak_at - 0.1), min(duration, peak_at + PUNCH_S)
 
 
 def _layout_filter(layout: Layout, ass_path: Path, H: int) -> str:
@@ -69,8 +89,9 @@ def _layout_filter(layout: Layout, ass_path: Path, H: int) -> str:
 
 async def render(src: Path, offset: float, duration: float, layout: Layout,
                  ass_text: str, out: Path, height: int = 1920, preset: str = "veryfast",
-                 threads: int = 2, outro_s: float = 0.0) -> bool:
+                 threads: int = 2, outro_s: float = 0.0, peak_at: float | None = None) -> bool:
     total = duration + max(outro_s, 0.0)
+    punch = punch_window(peak_at, duration)
     afilter = "aresample=async=1:first_pts=0,loudnorm=I=-14:TP=-1.5:LRA=11"
     if outro_s > 0:
         afilter += f",apad=pad_dur={outro_s:.2f}"
@@ -83,7 +104,7 @@ async def render(src: Path, offset: float, duration: float, layout: Layout,
         *(["-threads", str(threads)] if threads > 0 else []),
         "-ss", f"{offset:.2f}", "-t", f"{duration:.2f}", "-i", str(src),
         *(["-filter_complex_threads", str(threads)] if threads > 0 else []),
-        "-filter_complex", build_filter(layout, ass_path, height, outro_s),
+        "-filter_complex", build_filter(layout, ass_path, height, outro_s, punch),
         "-map", "[v]", "-map", "0:a:0?",
         "-af", afilter,
         "-t", f"{total:.2f}",  # borne de sortie : durée exacte garantie

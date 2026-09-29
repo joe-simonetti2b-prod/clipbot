@@ -84,7 +84,32 @@ class Resources:
         self.read = reader
         self.heavy = asyncio.Lock()
         self.pressure_until = 0.0
+        self.extra_off_until = 0.0          # 3e live coupé temporairement (manque de place)
         self.on_pressure = lambda: None     # branché : relance la veille (moins de lives)
+
+    def slots(self, wanted: int) -> int:
+        """Nombre de lives à suivre. Au-delà de 2, le live en plus n'est gardé que s'il
+        reste de la place : dès qu'un montage doit attendre la mémoire, on revient à 2
+        pendant 30 min. Sous vraie pression : 1 seul live."""
+        if self.under_pressure:
+            return 1
+        if wanted <= 2:
+            return wanted
+        now = time.time()
+        if now < self.extra_off_until:
+            return wanted - 1
+        r = self.used_ratio()
+        if r is not None and r > 0.70 and not self.heavy.locked():
+            self.extra_off_until = now + 1800     # déjà serré sans montage en cours
+            return wanted - 1
+        return wanted
+
+    def tighten(self, why: str) -> None:
+        first = time.time() >= self.extra_off_until
+        self.extra_off_until = time.time() + 1800
+        if first:
+            log.info("Mémoire : %s -> retour à 2 lives pendant 30 min", why)
+            self.on_pressure()
 
     @property
     def under_pressure(self) -> bool:
@@ -105,13 +130,16 @@ class Resources:
         """Attend qu'il reste `need_mb` libres (avec 8 % de marge). Au bout d'un moment,
         déleste un live pour libérer de la place, puis continue quoi qu'il arrive."""
         need = need_mb * 1024 * 1024
-        start, shed_done = time.time(), False
+        start, shed_done, tight_done = time.time(), False, False
         while True:
             used = self.read()
             if used is None or used + need < self.limit * 0.92:
                 return
             waited = time.time() - start
-            if waited > 60 and not shed_done:
+            if waited > 45 and not tight_done:
+                self.tighten(f"{used / 2**20:.0f} Mo utilisés, montage en attente")
+                tight_done = True
+            if waited > 120 and not shed_done:
                 self.shed(f"{used / 2**20:.0f} Mo utilisés, montage en attente")
                 shed_done = True
             if waited > max_wait_s:

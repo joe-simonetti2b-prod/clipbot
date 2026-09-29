@@ -322,10 +322,112 @@ class App:
         tg.commands.update({"boutique": boutique, "offrir": offrir, "rembourser": rembourser,
                             "repondre": repondre})
 
+        # ---------------- mode esport
+        async def esport_cmd(args):
+            from . import esport
+            if args and args[0].lower() in ("on", "off"):
+                store.set("esport_mode", args[0].lower() == "on")
+            elif not args:
+                store.set("esport_mode", not self.esport_on())
+            self.orch.rescan()
+            if self.esport_on():
+                return (f"🎮 Mode ESPORT : ON — {len(esport.ALL)} chaînes LoL / VALORANT / CS "
+                        "(officielles, co-streams, pros ; FR prioritaires).\n"
+                        "Kameto, Gotaga et Squeezie : seulement pendant un match.\n"
+                        "Un live n'est suivi que s'il est sur un jeu esport. Accroches, titres et "
+                        "hashtags passent en style esport.\n"
+                        "/lives pour forcer un live · /esport off pour revenir à ta liste.")
+            return "Mode ESPORT : OFF — retour à ta liste de chaînes habituelle."
+
+        # ---------------- menu à boutons (tout le pilotage, rangé par rubrique)
+        def menu_home(note: str = "") -> tuple[str, list]:
+            head = ((note + "\n\n") if note else "") + (
+                f"{'⏸️ EN PAUSE' if self.orch.paused else '🟢 ACTIF'} · "
+                f"{len(self.orch.watchers)} live(s) suivi(s) · mode "
+                f"{'ESPORT 🎮' if self.esport_on() else 'normal'} · auto "
+                f"{'on' if self.pipeline.auto else 'off'}\nQue veux-tu régler ?")
+            return head, [
+                [(f"🎮 Esport : {'ON' if self.esport_on() else 'OFF'}", "menu:esport")],
+                [("📺 Lives", "menu:lives"), ("📊 État", "menu:status")],
+                [("🚀 Publication", "menu:pub"), ("💰 Argent", "menu:money")],
+                [("⚙️ Réglages", "menu:set")],
+            ]
+
+        back = [("⬅️ Menu", "menu:home")]
+
+        async def menu_cb(arg: str):
+            if arg == "esport":
+                return menu_home(await esport_cmd([]))
+            if arg == "lives":
+                text, rows = lives_menu()
+                return text, rows + [back]
+            if arg == "status":
+                return await status([]), [[("🔄 Actualiser", "menu:status")], back]
+            if arg in ("pub", "pub_auto", "pub_relance", "pub_outro"):
+                note = ""
+                if arg == "pub_auto":
+                    note = (await auto([])).split("\n")[0]
+                elif arg == "pub_relance":
+                    note = await relance([])
+                elif arg == "pub_outro":
+                    note = await outro([])
+                text = ((note + "\n\n") if note else "") + (
+                    f"Publication auto : {'ON' if self.pipeline.auto else 'OFF'} · "
+                    f"outro : {'ON' if self.pipeline.outro else 'OFF'} · tag : "
+                    f"{self.pipeline.watermark or 'aucun'}{self.pipeline.tiktok_status_line()}\n"
+                    "Tag : /tag @compte")
+                return text, [
+                    [(f"Auto : {'ON' if self.pipeline.auto else 'OFF'}", "menu:pub_auto"),
+                     (f"Outro : {'ON' if self.pipeline.outro else 'OFF'}", "menu:pub_outro")],
+                    [("🚀 Envoyer la file TikTok maintenant", "menu:pub_relance")], back]
+            if arg in ("money", "shop_toggle"):
+                if arg == "shop_toggle":
+                    store.set("shop_enabled", not self.shop.enabled)
+                camps = store.get("whop_campaigns", {})
+                text = (self.shop.summary() + "\n\nWhop : " +
+                        (", ".join(f"{c} ({v.get('rate', '?')})" for c, v in camps.items())
+                         or "aucune campagne (/whop <chaîne> <taux> <règles>)")
+                        + "\n/offrir · /rembourser · /repondre")
+                return text, [[(f"Boutique : {'OUVERTE' if self.shop.enabled else 'fermée'}",
+                                "menu:shop_toggle")], back]
+            if arg in ("set", "pause", "chaines", "links"):
+                note = ""
+                if arg == "pause":
+                    note = await (resume([]) if self.orch.paused else pause([]))
+                elif arg == "chaines":
+                    note = (await chaines([]))[:2500]
+                elif arg == "links":
+                    note = await tiktok([]) + "\n\n" + await youtube([])
+                return ((note + "\n\n") if note else "") + (
+                    "Réglages — commandes texte : /add <chaîne> · /remove <chaîne> · "
+                    "/suivre <chaînes> · /algo · /tag · /whop"), [
+                    [("▶️ Reprendre" if self.orch.paused else "⏸️ Pause", "menu:pause"),
+                     ("📋 Chaînes", "menu:chaines")],
+                    [("🔑 Connexions TikTok / YouTube", "menu:links")], back]
+            return menu_home()
+        tg.callbacks["menu"] = menu_cb
+
+        async def menu(_):
+            text, rows = menu_home()
+            await tg.send_menu(text, rows)
+            return ""
+
+        async def aide(_):
+            return ("📖 Commandes\n"
+                    "Essentiel : /menu (tout en boutons) · /status · /esport · /lives · /relance\n\n"
+                    "Lives : /lives (choisir) · /suivre <chaînes> · /algo (auto) · /esport on|off\n"
+                    "Chaînes : /add <chaîne> · /remove <chaîne> · /chaines\n"
+                    "Publication : /auto on|off · /relance · /tag @compte · /outro on|off\n"
+                    "Comptes : /tiktok · /youtube\n"
+                    "Argent : /boutique · /offrir · /rembourser · /repondre · /whop\n"
+                    "Système : /pause · /resume\n\n"
+                    "Astuce : envoie-moi un lien de clip Twitch/Kick, je le monte pour ton compte.")
+
         tg.commands.update({"status": status, "auto": auto, "pause": pause, "resume": resume,
                             "add": add, "remove": remove, "chaines": chaines, "tiktok": tiktok, "youtube": youtube, "relance": relance,
                             "lives": lives, "suivre": suivre, "algo": algo, "tag": tag, "outro": outro,
-                            "whop": whop})
+                            "whop": whop, "esport": esport_cmd, "menu": menu, "aide": aide,
+                            "help": aide})
 
     # ------------------------------------------------------ exécution
     async def run(self) -> None:
@@ -359,14 +461,15 @@ class App:
             self.pipeline.CUSTOMER_MAX_WAIT_S = self.s.shop.max_wait_min * 60
             self.orch = Orchestrator(self.s, self.store, session, self._on_clip)
             self.orch.notify = lambda text: asyncio.create_task(self.tg.send("🔎 " + text))
-            self.orch.capacity = lambda: 1 if self.res.under_pressure else \
-                self.s.discovery.max_concurrent_streams
+            # 3 lives si la mémoire le permet, sinon 2 (et 1 sous forte pression)
+            self.orch.capacity = lambda: self.res.slots(self.s.discovery.max_concurrent_streams)
             self.res.on_pressure = self.orch.rescan
             p = self.s.processing
             self.harvester = ClipHarvester(
                 self.store, session, self.s.capture.work_dir, on_new=self.pipeline.wake,
                 allowed=lambda: {n for _, n in self.orch.scanner.targets()},
-                top_channels=self._top_channels, enabled_top=p.top_clips, res=self.res)
+                top_channels=self._top_channels, enabled_top=p.top_clips, res=self.res,
+                esport=self.esport_on)
             if p.viewer_clips:
                 self.orch.on_link = self.harvester.offer
 
@@ -428,15 +531,24 @@ class App:
             await self.orch.stop_all()
             await runner.cleanup()
 
+    def esport_on(self) -> bool:
+        return bool(self.store.get("esport_mode", False))
+
     def _top_channels(self) -> list[str]:
         """Créateurs Twitch dont on récupère les meilleurs clips du jour :
-        les lives suivis, les choix manuels, puis les créateurs « focus »."""
+        les lives suivis, les choix manuels, puis les créateurs « focus » — ou, en mode
+        esport, les chaînes esport (officielles et FR d'abord)."""
+        from . import esport
         from .models import Platform
         tw = {n for p, n in self.orch.scanner.targets() if p is Platform.TWITCH}
         out = [w.c.channel for w in self.orch.watchers.values() if w.c.platform is Platform.TWITCH]
         out += [n for n in self.orch.pinned() if n in tw]
-        out += [parse_spec(f)[1] for f in self.s.discovery.focus_channels if parse_spec(f)[1] in tw]
-        return list(dict.fromkeys(out))
+        if self.esport_on():
+            out += [n for n in esport.top_clip_logins() if n in tw]
+        else:
+            out += [parse_spec(f)[1] for f in self.s.discovery.focus_channels
+                    if parse_spec(f)[1] in tw]
+        return list(dict.fromkeys(out))[:30]
 
     async def _check_tiktok(self) -> None:
         if not self.tiktok.configured:

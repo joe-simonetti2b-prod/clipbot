@@ -47,6 +47,28 @@ FORCED_NOTE = "envoyé par toi"   # = ClipHarvester.OWNER_NOTE : jamais jeté pa
 DAY = 86400
 
 
+MIN_CLIP_S = 12.0       # jamais plus court (contexte minimum)
+MAX_CUT_S = 12.0        # jamais plus de 12 s coupées au début
+
+
+def tighten(duration: float, peak_at: float | None, start: float,
+            end: float | None) -> tuple[float, float]:
+    """Coupe proposée par l'IA, bornée : (secondes coupées au début, nouvelle durée).
+    Le moment fort (pic du chat) reste toujours dans le clip, avec 3 s avant et 3 s après."""
+    cut = min(max(0.0, start or 0.0), MAX_CUT_S, duration * 0.35)
+    if peak_at is not None:
+        cut = min(cut, max(0.0, peak_at - 3.0))
+    stop = duration
+    if end is not None and end > 0:
+        stop = min(duration, max(end, cut + MIN_CLIP_S))
+        if peak_at is not None:
+            stop = max(stop, min(duration, peak_at + 3.0))
+    if stop - cut < MIN_CLIP_S:
+        cut = max(0.0, stop - MIN_CLIP_S)
+    cut = round(cut, 2)
+    return cut, round(stop - cut, 2)
+
+
 def parse_hours(spec: str) -> tuple[int, int]:
     """« 11-23 » -> (11, 23) ; « 20-2 » passe minuit ; invalide -> toute la journée."""
     try:
@@ -330,7 +352,10 @@ class Pipeline:
         llm = LLM.from_settings(p)
         # Note + textes d'abord : un clip mal noté n'est jamais monté (gain de CPU)
         out_lang = target or tr.language or "fr"
-        copy = await write_copy(self.session, llm, clip, tr.text, out_lang, cta, p.ad_disclosure)
+        from . import esport
+        style = esport.STYLE if (self.store.get("esport_mode") and not customer) else ""
+        copy = await write_copy(self.session, llm, clip, tr.text, out_lang, cta, p.ad_disclosure,
+                                style=style, words=tr.words)
 
         if not forced and copy.score is not None and copy.score < p.min_ai_score:
             log.info("Clip %s jeté par l'IA (note %s/10)", cid, copy.score)
@@ -348,6 +373,19 @@ class Pipeline:
             words = translated
             log.info("Clip %s : sous-titres traduits %s -> %s", cid, tr.language, target)
 
+        # Rythme : on entre directement dans l'action (début mou coupé par l'IA, bornes
+        # de sécurité autour du moment fort). Jamais sur une commande client.
+        peak_at = clip.get("peak_at")
+        if not customer:
+            cut, new_dur = tighten(duration, peak_at, copy.start, copy.end)
+            if cut or new_dur < duration:
+                log.info("Clip %s : %.0f s coupées au début, %.0f s → %.0f s", cid, cut,
+                         duration, new_dur)
+                offset, duration = offset + cut, new_dur
+                words = [type(w)(w.start - cut, w.end - cut, w.text) for w in words
+                         if w.start >= cut and w.start < cut + new_dur]
+                peak_at = None if peak_at is None else peak_at - cut
+
         out = self.final_dir / f"clip_{cid}.mp4"
         domain = {"twitch": "twitch.tv", "kick": "kick.com"}.get(clip["platform"], "")
         credit = f"{domain}/{clip['channel']}" if (p.video_credit and domain) else ""
@@ -359,10 +397,10 @@ class Pipeline:
             ass = build_ass(words, copy.hook, layout.kind, duration, p.font, credit,
                             karaoke=not translated, keywords=copy.keywords, cover=copy.cover,
                             creator=clip["channel"], watermark=watermark, outro_s=outro_s,
-                            peak_at=clip.get("peak_at"))
+                            peak_at=peak_at)
             ok = await render(src, offset, duration, layout, ass, out,
                               height=p.output_height, preset=p.x264_preset,
-                              threads=p.ffmpeg_threads, outro_s=outro_s)
+                              threads=p.ffmpeg_threads, outro_s=outro_s, peak_at=peak_at)
             return layout, ok
 
         layout, ok = await self._heavy(montage)
@@ -399,7 +437,7 @@ class Pipeline:
     async def run_publisher(self) -> None:
         while True:
             self._expire_stale()
-            row = self.store.next_clip("approved")
+            row = self.next_to_publish()
             if row is None:
                 self._publish_wake.clear()
                 try:
@@ -428,7 +466,7 @@ class Pipeline:
                     except asyncio.TimeoutError:
                         pass
                     continue
-                row = self.store.next_clip("approved")
+                row = self.next_to_publish()
                 if row is None:
                     continue
                 cid = row["id"]
@@ -437,6 +475,21 @@ class Pipeline:
             await self._publish_everywhere(dict(row), targets)
             # Limites TikTok/YouTube : on espace les envois
             await asyncio.sleep(30)
+
+    def next_to_publish(self):
+        """Meilleur clip en file, mais pas deux fois de suite le même streamer si un autre
+        clip presque aussi bon (≤ 1 point d'écart) attend : un fil varié retient mieux."""
+        rows = self.store.db.execute(
+            "SELECT * FROM clips WHERE status='approved' AND customer_id IS NULL "
+            "ORDER BY COALESCE(ai_score, 0) DESC, score DESC, created DESC LIMIT 10").fetchall()
+        if not rows:
+            return None
+        last = self.store.get("last_published_channel") or ""
+        top = rows[0]["ai_score"] or 0
+        for r in rows:
+            if (r["channel"] or "").lower() != last and (r["ai_score"] or 0) >= top - 1:
+                return r
+        return rows[0]
 
     MAX_WAITING = TIKTOK_PENDING_MAX   # une journée de places TikTok, pas plus
 
@@ -522,6 +575,7 @@ class Pipeline:
         if ids:
             self.store.update_clip(cid, status="published", publish_id=json.dumps(ids),
                                    error=None, published_at=time.time())
+            self.store.set("last_published_channel", (row.get("channel") or "").lower())
             text = html.escape(f"Clip #{cid} ({row.get('channel') or '?'})\n" + "\n".join(report),
                                quote=False)
             if "tiktok" in ids and self.tiktok.mode == "inbox":

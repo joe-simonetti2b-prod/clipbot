@@ -79,29 +79,51 @@ seul changement par cycle. La file de montage alterne entre les créateurs.
 
 ## Commandes Telegram
 
+`/menu` ouvre tout le pilotage en boutons (Esport · Lives · État · Publication · Argent ·
+Réglages). Le menu de commandes de Telegram ne montre que l'essentiel ; `/aide` liste tout.
+
 | Commande | Effet |
 |---|---|
+| `/menu` | tout piloter avec des boutons |
 | `/status` | lives suivis, clips du jour, état TikTok |
-| `/add kamet0` · `/add kick:xxx` | suivre une chaîne |
-| `/remove …` · `/chaines` | gérer la liste |
-| `/auto on` / `off` | publier sans validation |
-| `/lives` | choisir à la main les lives suivis (boutons) ; `/suivre pseudo` ; `/algo` pour revenir en auto |
-| `/tag @compte` · `/outro on/off` | tag incrusté sur les vidéos · fin « S'abonner / Partager » |
-| `/relance` | renvoyer tout de suite la file vers TikTok |
-| `/whop nom taux règles…` · `/whop off nom` · `/whop` | suivre une campagne Whop : ajoute les règles à la légende et renvoie le lien de la vidéo une fois publiée |
+| `/esport on/off` | mode esport (voir plus bas) |
+| `/lives` · `/suivre pseudo` · `/algo` | choisir les lives à la main, ou rendre la main à l'algorithme |
+| `/add kamet0` · `/add kick:xxx` · `/remove …` · `/chaines` | gérer la liste de chaînes |
+| `/auto on/off` · `/relance` | publier sans validation · envoyer la file TikTok tout de suite |
+| `/tag @compte` · `/outro on/off` | tag incrusté · fin « S'abonner / Partager » |
+| `/whop …` · `/boutique` · `/offrir` · `/rembourser` · `/repondre` | argent : Whop et boutique |
+| `/tiktok` · `/youtube` | liens de connexion |
+| `/pause` · `/resume` | couper / relancer la surveillance |
+
+Envoie un lien de clip Twitch/Kick au bot : il est monté pour ton compte, en priorité.
+
+### Mode esport (`/esport`)
+Le bot ne suit plus que l'esport : diffusions officielles et co-streams (OTP, Caedrel, LEC,
+VCT, ESL…), joueurs et streamers compétitifs LoL / VALORANT / Counter-Strike, en français
+d'abord (priorité ×2, et ×1,5 pour un vrai match). Kameto, Gotaga et Squeezie ne sont suivis
+que pendant un match (titre du live). Un live n'est suivi que s'il est sur un jeu esport ; les
+accroches, titres et hashtags passent en style esport, et les meilleurs clips Twitch des
+chaînes esport sont récupérés toutes les 20 min, classés par vitesse de montée des vues.
+Liste dans `clipbot/esport.py` ; une chaîne introuvable est ignorée automatiquement.
+
+### Montage
+L'IA coupe le début mou (12 s max, jamais le moment fort) pour entrer directement dans
+l'action, un zoom « punch-in » marque le moment fort, et les clips qui n'ont de sens que pour
+les habitués du live (dons, abonnements, blagues internes) sont notés bas et écartés.
+Un même streamer n'est pas publié deux fois de suite si un autre clip presque aussi bon attend.
+
+### Lives simultanés
+`MAX_CONCURRENT_STREAMS=3` : le 3e live n'est gardé que si la mémoire le permet ; dès qu'un
+montage doit attendre, retour à 2 pendant 30 min (et 1 seul sous forte pression).
 
 ### Croissance automatique
 Le bot apprend tout seul, à partir des vraies vues TikTok de chaque chaîne (une fois les
 statistiques actives), quelles chaînes suivies performent le mieux, et leur donne
 automatiquement plus de temps de veille (jusqu'à 1,8×) — celles qui font moins en reçoivent
-un peu moins (jusqu'à 0,7×). Rien à configurer, ça s'ajuste tout seul au fil des clips publiés.
+un peu moins (jusqu'à 0,7×).
 
-Whop n'a pas d'API publique et sa liste de campagnes n'est consultable qu'une fois connecté :
-impossible de la surveiller depuis le bot. Il t'envoie donc un rappel régulier (toutes les 48 h)
-avec la liste des chaînes que tu suis et qui n'ont pas encore de campagne enregistrée, pour que
-tu ailles vérifier en 30 secondes dans l'app — puis `/whop` pour l'intégrer.
-| `/pause` · `/resume` | couper / relancer la surveillance |
-| `/tiktok` | lien de connexion TikTok (une fois) |
+Whop n'a pas d'API publique : le bot t'envoie un rappel toutes les 48 h avec les chaînes que
+tu suis sans campagne enregistrée, pour vérifier dans l'app puis `/whop`.
 
 ## Options à activer plus tard
 

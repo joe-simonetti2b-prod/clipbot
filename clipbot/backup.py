@@ -26,7 +26,7 @@ PERSISTED = ("tiktok_tokens", "youtube_tokens", "auto_publish", "paused",
              "extra_channels", "telegram_owner", "youtube_quota",
              "pinned_channels", "watermark", "outro", "whop_campaigns",
              "tiktok_inbox_log", "manual_log", "channel_perf_boost", "rewards_last_pct",
-             "tiktok_analytics_denied",
+             "tiktok_analytics_denied", "esport_mode", "last_published_channel",
              # Boutique : crédits et paiements des clients, commandes en cours
              "shop_enabled", "shop_customers", "shop_payments", "shop_jobs", "shop_codes")
 HEADER = "💾 Sauvegarde clipbot — ne pas supprimer ni désépingler\n"

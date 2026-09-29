@@ -198,7 +198,9 @@ class Orchestrator:
                                     extra_channels=lambda: store.get("extra_channels", [])
                                     + store.get("pinned_channels", []),
                                     on_resolved=lambda r: self.notify(r.summary()),
-                                    perf=lambda: store.get("channel_perf_boost", {}))
+                                    perf=lambda: store.get("channel_perf_boost", {}),
+                                    esport=lambda: bool(store.get("esport_mode", False)),
+                                    pinned=lambda: store.get("pinned_channels", []))
         self.notify = lambda text: None   # branché par l'application (message Telegram)
         self.extractor = ClipExtractor(settings.capture, settings.hype)
         self._rescan = asyncio.Event()

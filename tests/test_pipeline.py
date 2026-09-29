@@ -1068,15 +1068,20 @@ def test_tiktok_slots_are_spent_at_good_hours_and_spaced(tmp_path):
 
     s = Settings()
     s.capture.work_dir = tmp_path
-    s.publish.tiktok_hours, s.publish.tiktok_gap_min = "11-23", 90
+    s.publish.tiktok_hours, s.publish.tiktok_gap_min = "0-24", 90
     store = Store(tmp_path / "w.db")
     p = pipeline_mod.Pipeline(s, store, None, FakeTelegram(), SimpleNamespace(configured=True, connected=True))
-    now = at(15)
+    import time as _t
+    now = _t.time()
     store.set("tiktok_inbox_log", [now - 30 * 60, now - 25 * 3600])   # le 2e a plus de 24 h
+    assert len(p.inbox_log()) == 1
     assert p.tiktok_wait(now) == pytest.approx(60 * 60, abs=5)          # 90 min après le dernier
-    assert p.tiktok_wait(at(3)) > 7 * 3600                              # la nuit : on garde
     p.force_until = now + 600                                           # /relance
     assert p.tiktok_wait(now) == 0
+    p.force_until = 0
+    store.set("tiktok_inbox_log", [])
+    s.publish.tiktok_hours = "11-23"
+    assert p.tiktok_wait(at(3)) == pytest.approx(8 * 3600, abs=5)       # la nuit : on garde
 
 
 def test_overflow_goes_to_manual_lane_with_copyable_caption(tmp_path):
@@ -1369,7 +1374,8 @@ def test_memory_guard_sheds_a_live_and_rotation_shrinks(tmp_path):
         finally:
             r.time.time = t0
     asyncio.run(scenario())
-    assert shed == [1]
+    assert shed == [1, 1]                  # 1) retour à 2 lives, 2) un seul live
+    assert res.slots(3) == 1 and res.under_pressure
     used["v"] = 100 * 2**20
     asyncio.run(res.wait_room(200, poll_s=0))                         # place libre : immédiat
 
@@ -1445,3 +1451,183 @@ def test_only_real_clip_links_are_downloaded(tmp_path):
         assert clip_url(live) == ""
         with pytest.raises(RuntimeError, match="pas un lien de clip"):
             asyncio.run(download_clip(live, tmp_path))
+
+
+# ------------------------------------------------------ esport, rythme, menu
+def test_esport_filter_only_esport_games_and_matches_for_match_only_creators():
+    from clipbot import esport
+    mk = lambda ch, cat, title="", viewers=10000: SimpleNamespace(
+        channel=ch, category=cat, title=title, viewers=viewers)
+    assert esport.accepts(mk("otplol_", "League of Legends"))
+    assert not esport.accepts(mk("otplol_", "Just Chatting"))              # pas un jeu esport
+    assert not esport.accepts(mk("kamet0", "League of Legends", "ranked chill"))
+    assert esport.accepts(mk("kamet0", "League of Legends", "KC vs G2 - LEC co-stream"))
+    assert not esport.accepts(mk("kamet0", "Just Chatting", "KC vs G2"))
+    assert esport.accepts(mk("scream", "VALORANT")) and esport.accepts(mk("brawks", "Counter-Strike"))
+    assert not esport.accepts(mk("nico_la", "League of Legends"))           # hors liste
+    assert esport.boost(mk("otplol_", "League of Legends")) > esport.boost(mk("caedrel", "League of Legends"))
+    assert all(s.startswith("twitch:") for s in esport.specs())
+    assert "otplol_" in esport.top_clip_logins()[:3]
+
+
+def test_scanner_esport_mode_swaps_list_and_filters(monkeypatch):
+    from clipbot.discovery import TrendScanner
+    from clipbot.config import DiscoveryConfig
+    mode = {"on": False}
+    cfg = DiscoveryConfig(allowed_channels=["nico_la"])
+    sc = TrendScanner(cfg, session=None, esport=lambda: mode["on"], pinned=lambda: ["nico_la"])
+    assert [n for _, n in sc.specs()] == ["nico_la"]
+    mode["on"] = True
+    names = [n for _, n in sc.specs()]
+    assert "otplol_" in names and "kamet0" in names and "nico_la" in names   # choix manuel gardé
+    from clipbot.models import StreamCandidate
+    lives = [StreamCandidate(Platform.TWITCH, "otplol_", "1", "u", "Worlds", "League of Legends", 20000),
+             StreamCandidate(Platform.TWITCH, "kamet0", "2", "u", "chill", "League of Legends", 30000),
+             StreamCandidate(Platform.TWITCH, "caedrel", "3", "u", "LCK", "League of Legends", 40000),
+             StreamCandidate(Platform.TWITCH, "nico_la", "4", "u", "IRL", "IRL", 50000)]
+
+    async def fake_live(n, p):
+        return lives
+    sc._twitch_live = fake_live
+    sc.resolution = type("R", (), {"targets": [(Platform.TWITCH, c.channel) for c in lives],
+                                   "at": 10**12})()
+    sc._resolved_for = tuple(sc.specs())
+    got = [c.channel for c in asyncio.run(sc.scan())]
+    assert "kamet0" not in got and "nico_la" in got
+    assert got.index("otplol_") < got.index("caedrel")       # FR + officiel passe devant
+
+
+def test_tighten_cuts_slow_start_but_keeps_the_peak():
+    t = pipeline_mod.tighten
+    assert t(40, 25, 8, None) == (8, 32)                      # 8 s de mise en place coupées
+    assert t(40, 25, 30, None) == (12, 28)                    # jamais plus de 12 s
+    assert t(40, 6, 8, None) == (3, 37)                       # le pic garde 3 s avant lui
+    assert t(40, 25, 0, 20) == (0, 28)                        # fin après le pic + 3 s
+    assert t(40, None, 5, 10) == (5, 12)                      # jamais moins de 12 s
+    assert t(8, None, 4, 6) == (0, 8)                         # clip court : intact
+
+
+def test_punch_zoom_only_on_the_peak(tmp_path, source_video):
+    from clipbot.render import build_filter, punch_window
+    assert punch_window(None, 20) is None and punch_window(0.2, 20) is None
+    a, b = punch_window(5.0, 20)
+    assert a == pytest.approx(4.9) and b == pytest.approx(6.3)
+    f = build_filter(Layout("blur"), tmp_path / "x.ass", 1280, 0, (a, b))
+    assert "trim=start=4.90:end=6.30" in f and "crop=720:1280" in f
+    ass = build_ass(WORDS, "Accroche", "blur", 8)
+    out = tmp_path / "p.mp4"
+    assert asyncio.run(render(source_video, 1.0, 8.0, Layout("blur"), ass, out, height=1280,
+                              preset="ultrafast", threads=1, peak_at=3.0))
+    assert float(probe(out)["format"]["duration"]) == pytest.approx(8, abs=0.2)
+
+
+def test_copy_prompt_has_rules_style_timestamps_and_parses_cut():
+    from clipbot import copywriter as cw
+    from clipbot.esport import STYLE
+    txt = cw.timed_transcript(WORDS, every_s=2)
+    assert txt.startswith("[0s] Non mais regarde") and "[3s]" in txt
+    prompt = cw.PROMPT.format(channel="otplol_", platform="Twitch", title="t", category="LoL",
+                              reason="action", tokens="x", duration=30, transcript=txt,
+                              lang="français", style=STYLE)
+    assert "ESPORT" in prompt and "INSANE" in prompt and '"start"' in prompt
+
+    async def fake_ask(session, llm, prompt, max_tokens=600):
+        return {"score": 8, "hook": "KC élimine G2", "cover": "KC ÉLIMINE G2", "caption": "x",
+                "hashtags": ["lol"], "start": "6.5", "end": None}
+    orig = cw.ask_json
+    cw.ask_json = fake_ask
+    try:
+        llm = SimpleNamespace(enabled=True)
+        c = asyncio.run(cw.write_copy(None, llm, {"channel": "otplol_", "platform": "twitch"},
+                                      "", "fr", "", False, style=STYLE, words=WORDS))
+    finally:
+        cw.ask_json = orig
+    assert c.start == 6.5 and c.end is None and c.cover == "KC ÉLIMINE G2"
+
+
+def test_top_clips_ranked_by_speed_and_esport_game(tmp_path):
+    import time as _t
+    from datetime import datetime, timezone
+    from clipbot.harvest import ClipHarvester
+    now = _t.time()
+    iso = lambda h: datetime.fromtimestamp(now - h * 3600, timezone.utc).isoformat().replace("+00:00", "Z")
+    clips = [
+        {"slug": "OldBig", "viewCount": 5000, "createdAt": iso(20), "game": {"name": "League of Legends"}, "login": "a"},
+        {"slug": "FreshHot", "viewCount": 2000, "createdAt": iso(0.5), "game": {"name": "League of Legends"}, "login": "b"},
+        {"slug": "Chatting", "viewCount": 9000, "createdAt": iso(0.5), "game": {"name": "Just Chatting"}, "login": "kamet0"},
+        {"slug": "Tiny", "viewCount": 50, "createdAt": iso(0.1), "game": {"name": "VALORANT"}, "login": "c"},
+    ]
+    h = ClipHarvester.__new__(ClipHarvester)
+    h._seen, h.store = {}, Store(tmp_path / "h.db")
+    h.esport = lambda: True
+    assert [c["slug"] for c in h.pick_top(clips, 2, now)] == ["FreshHot", "OldBig"]
+    h.esport = lambda: False
+    assert h.pick_top(clips, 1, now)[0]["slug"] == "Chatting"
+
+
+def test_third_live_only_when_memory_allows():
+    from clipbot.resources import Resources
+    used = {"v": 200 * 2**20}
+    res = Resources(512, reader=lambda: used["v"])
+    res.limit = 512 * 2**20
+    assert res.slots(3) == 3 and res.slots(2) == 2
+    used["v"] = 400 * 2**20                               # serré, sans montage en cours
+    assert res.slots(3) == 2
+    used["v"] = 200 * 2**20
+    assert res.slots(3) == 2                              # reste à 2 pendant 30 min
+    res.extra_off_until = 0
+    assert res.slots(3) == 3
+
+
+def test_publisher_alternates_creators(tmp_path):
+    s = Settings()
+    s.capture.work_dir = tmp_path
+    store = Store(tmp_path / "alt.db")
+    p = pipeline_mod.Pipeline(s, store, None, FakeTelegram(), SimpleNamespace())
+    a1 = store.add_clip(platform="twitch", channel="nico_la", reason="r", score=5, ai_score=9, status="approved")
+    b1 = store.add_clip(platform="twitch", channel="otplol_", reason="r", score=5, ai_score=8, status="approved")
+    store.add_clip(platform="twitch", channel="zerator", reason="r", score=5, ai_score=6, status="approved")
+    assert p.next_to_publish()["id"] == a1
+    store.set("last_published_channel", "nico_la")
+    assert p.next_to_publish()["id"] == b1                # 1 point d'écart : on alterne
+    store.update_clip(b1, status="published")
+    assert p.next_to_publish()["id"] == a1                # 3 points d'écart : le meilleur passe
+
+
+def test_menu_buttons_navigate_and_toggle_esport(tmp_path):
+    from clipbot.app import App
+    s = Settings()
+    s.capture.work_dir = tmp_path
+    app = App(s)
+    sent = []
+
+    class Tg:
+        commands, callbacks = {}, {}
+        async def send_menu(self, text, rows): sent.append((text, rows))
+    app.tg = Tg()
+    app.orch = SimpleNamespace(watchers={}, paused=False, last_live=[], rescan=lambda: None,
+                               scanner=SimpleNamespace(resolution=None, specs=lambda: []))
+    app.pipeline = SimpleNamespace(auto=True, outro=False, watermark="@clipclaptrap",
+                                   tiktok_status_line=lambda: "", waiting_count=lambda: 0,
+                                   tiktok_full_until=0, force_until=0,
+                                   _publish_wake=asyncio.Event())
+    app.shop = SimpleNamespace(summary=lambda: "🛒 Boutique", enabled=True)
+    app.shop_bot = app.tg
+    app.tiktok = app.youtube = SimpleNamespace(configured=False)
+    app.tt_analytics = SimpleNamespace(status_line=lambda: "")
+    App._register_commands(app)
+
+    async def scenario():
+        assert await app.tg.commands["menu"]([]) == ""
+        text, rows = sent[0]
+        datas = [d for row in rows for _, d in row]
+        assert {"menu:esport", "menu:lives", "menu:pub", "menu:money", "menu:set"} <= set(datas)
+        cb = app.tg.callbacks["menu"]
+        text, rows = await cb("esport")
+        assert app.esport_on() and "ESPORT : ON" in text
+        text, rows = await cb("pub")
+        assert "Auto : ON" in str(rows) and ("⬅️ Menu", "menu:home") in rows[-1]
+        text, rows = await cb("money")
+        assert "Boutique" in text
+        assert "Commandes" in await app.tg.commands["aide"]([])
+    asyncio.run(scenario())

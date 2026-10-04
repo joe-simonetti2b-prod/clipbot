@@ -1513,7 +1513,8 @@ def test_punch_zoom_only_on_the_peak(tmp_path, source_video):
     a, b = punch_window(5.0, 20)
     assert a == pytest.approx(4.9) and b == pytest.approx(6.3)
     f = build_filter(Layout("blur"), tmp_path / "x.ass", 1280, 0, (a, b))
-    assert "trim=start=4.90:end=6.30" in f and "crop=720:1280" in f
+    assert "between(t\\,4.90\\,6.30)" in f and "eval=frame" in f and "crop=720:1280" in f
+    assert "split" not in f.split("fps=30")[1].split("ass=")[0]      # rien de mis en attente
     ass = build_ass(WORDS, "Accroche", "blur", 8)
     out = tmp_path / "p.mp4"
     assert asyncio.run(render(source_video, 1.0, 8.0, Layout("blur"), ass, out, height=1280,
@@ -1631,3 +1632,25 @@ def test_menu_buttons_navigate_and_toggle_esport(tmp_path):
         assert "Boutique" in text
         assert "Commandes" in await app.tg.commands["aide"]([])
     asyncio.run(scenario())
+
+
+def test_render_memory_stays_low_with_late_peak(tmp_path):
+    """Régression 03/10 : zoom sur un pic tardif = 1 Go de mémoire -> arrêts Render."""
+    import resource
+    src = tmp_path / "long.ts"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc2=size=1280x720:rate=30", "-f", "lavfi", "-i",
+                    "sine=frequency=330:sample_rate=48000", "-t", "26", "-c:v", "libx264",
+                    "-preset", "ultrafast", "-c:a", "aac", "-f", "mpegts", str(src)], check=True)
+    before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    ass = build_ass(WORDS, "Accroche", "blur", 24, outro_s=1.8)
+    assert asyncio.run(render(src, 1.0, 24.0, Layout("blur"), ass, tmp_path / "m.mp4",
+                              height=1280, preset="ultrafast", threads=1, outro_s=1.8,
+                              peak_at=20.0))
+    peak_mb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024
+    assert peak_mb < 220 or before / 1024 >= 220, peak_mb
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(tmp_path / "m.mp4"),
+                          "-vn", "-af", "ebur128=framelog=quiet", "-f", "null", "-"],
+                         capture_output=True, text=True).stderr
+    lufs = float(re.findall(r"I:\s+(-?[\d.]+) LUFS", out)[-1])
+    assert lufs == pytest.approx(-14, abs=1.5)

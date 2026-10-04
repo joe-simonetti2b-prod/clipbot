@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 
 from .resources import niced
@@ -39,13 +40,14 @@ def build_filter(layout: Layout, ass_path: Path, height: int = 1920, outro_s: fl
     pad = f"tpad=stop_mode=clone:stop_duration={outro_s:.2f}," if outro_s > 0 else ""
     zoom = ""
     if punch:
-        # Seules les ~40 images du moment fort sont agrandies (coût quasi nul) puis
-        # superposées au reste ; avant et après, l'image est strictement identique.
+        # Zoom évalué image par image dans UNE seule chaîne : seules les images du moment
+        # fort sont agrandies puis recadrées, rien n'est mis en attente.
+        # (L'ancienne version split/trim/overlay gardait en mémoire toutes les images
+        # jusqu'au moment fort : jusqu'à 1 Go -> arrêts « mémoire » sur Render, 03/10.)
         W, H = _even(height * 9 / 16), height
         a, b = punch
-        zoom = (f"split=2[pa][pb];[pb]trim=start={a:.2f}:end={b:.2f},"
-                f"scale=w=trunc(iw*{PUNCH_ZOOM}/2)*2:h=-2,crop={W}:{H}[pz];"
-                f"[pa][pz]overlay=eof_action=pass:repeatlast=0,")
+        zoom = (f"scale=w='if(between(t\\,{a:.2f}\\,{b:.2f})\\,trunc(iw*{PUNCH_ZOOM}/2)*2\\,iw)'"
+                f":h=-2:eval=frame,crop={W}:{H},")
     return _layout_filter(layout, ass_path, height).replace(
         "fps=30,", f"fps=30:start_time=0,{pad}{zoom}", 1)
 
@@ -92,11 +94,54 @@ async def render(src: Path, offset: float, duration: float, layout: Layout,
                  threads: int = 2, outro_s: float = 0.0, peak_at: float | None = None) -> bool:
     total = duration + max(outro_s, 0.0)
     punch = punch_window(peak_at, duration)
-    afilter = "aresample=async=1:first_pts=0,loudnorm=I=-14:TP=-1.5:LRA=11"
+    # Volume : -14 LUFS mesuré d'abord (passe son seule, légère), puis gain fixe + limiteur
+    # dans la passe image. loudnorm dans la même passe que l'image retardait le son de ~3 s
+    # et obligeait FFmpeg à garder ~3 s d'images brutes en mémoire (mesuré : 305 Mo contre
+    # ~120 Mo) — cause principale des arrêts « mémoire » sur Render.
+    gain = await measure_gain(src, offset, duration)
+    afilter = (f"aresample=async=1:first_pts=0,volume={gain:.2f}dB,"
+               f"alimiter=limit={LIMIT:.3f}:level=disabled")
     if outro_s > 0:
         afilter += f",apad=pad_dur={outro_s:.2f}"
     ass_path = out.with_suffix(".ass")
     ass_path.write_text(ass_text, encoding="utf-8")
+    ok = False
+    for attempt_punch in ([punch, None] if punch else [None]):
+        ok, err = await _run(src, offset, duration, layout, ass_path, out, height, preset,
+                             threads, outro_s, attempt_punch, afilter, total)
+        if ok:
+            break
+        log.error("Montage échoué%s : %s", " (nouvel essai sans zoom)" if attempt_punch else "",
+                  err[-400:])
+    ass_path.unlink(missing_ok=True)
+    return ok
+
+
+TARGET_LUFS = -14.0
+LIMIT = 10 ** (-1.5 / 20)        # plafond -1,5 dBFS
+
+
+async def measure_gain(src: Path, offset: float, duration: float) -> float:
+    """Gain (dB) pour amener le clip à -14 LUFS (référence TikTok/Shorts)."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{offset:.2f}", "-t", f"{duration:.2f}",
+           "-i", str(src), "-vn", "-map", "0:a:0?", "-af", "ebur128=framelog=quiet",
+           "-f", "null", "-"]
+    try:
+        proc = await asyncio.create_subprocess_exec(*niced(cmd), stdout=asyncio.subprocess.DEVNULL,
+                                                    stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate()
+        m = re.findall(r"I:\s+(-?[\d.]+) LUFS", err.decode(errors="ignore"))
+        level = float(m[-1]) if m else None
+    except Exception as e:
+        log.warning("Mesure du volume impossible : %s", e)
+        level = None
+    if level is None or level < -70:          # silence ou pas de son : on ne touche à rien
+        return 0.0
+    return max(-20.0, min(20.0, TARGET_LUFS - level))
+
+
+async def _run(src, offset, duration, layout, ass_path, out, height, preset, threads,
+               outro_s, punch, afilter, total) -> tuple[bool, str]:
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         # -threads AVANT -i = décodeur : sans ça il ouvre un fil par cœur de l'hôte,
@@ -118,8 +163,4 @@ async def render(src: Path, offset: float, duration: float, layout: Layout,
     # principal et Render le redémarrait (contrôle de santé sans réponse en 5 s).
     proc = await asyncio.create_subprocess_exec(*niced(cmd), stderr=asyncio.subprocess.PIPE)
     _, err = await proc.communicate()
-    ass_path.unlink(missing_ok=True)
-    if proc.returncode != 0:
-        log.error("Montage échoué : %s", err.decode(errors="ignore")[-400:])
-        return False
-    return True
+    return proc.returncode == 0, err.decode(errors="ignore")

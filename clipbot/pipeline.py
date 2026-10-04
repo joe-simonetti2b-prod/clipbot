@@ -318,10 +318,10 @@ class Pipeline:
         if self.res is None:
             return await coro_fn()
         async with self.res.heavy:
-            # Mesuré en production (03/10) : un montage monte jusqu'à ~250 Mo d'un coup
-            # (tué par Render à 512 Mo avec 3 lives). On réserve 240 Mo ; si la place
-            # manque, un live est délesté avant de monter, au bout de 5 min on monte quand même.
-            await self.res.wait_room(240, max_wait_s=300)
+            # Montage mesuré à ~120 Mo depuis la correction du 04/10 (zoom et son traités
+            # sans mise en attente d'images) ; marge comprise : 160 Mo. Si la place manque,
+            # un live est délesté avant de monter ; au bout de 5 min on monte quand même.
+            await self.res.wait_room(160, max_wait_s=300)
             return await coro_fn()
 
     async def _process(self, clip: dict) -> None:
